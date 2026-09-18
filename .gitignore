@@ -1,0 +1,11 @@
+/.build/
+/target/
+/dist/
+/artifacts/
+*.db
+*.db-shm
+*.db-wal
+*.part
+*.cookie
+__pycache__/
+*.pyc

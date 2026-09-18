@@ -1,0 +1,66 @@
+name: Build and verify
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, ubuntu-24.04, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt
+          rustup default 1.95.0
+      - name: Media test dependencies
+        run: |
+          python -m pip install yt-dlp
+          if ($IsWindows) { choco install ffmpeg -y --no-progress }
+          elseif ($IsLinux) { sudo apt-get update; sudo apt-get install -y ffmpeg pkg-config libssl-dev }
+          else { brew install ffmpeg }
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Tests
+        run: ./Build.ps1 test
+      - name: Clippy
+        run: ./Build.ps1 lint
+      - name: Release
+        run: ./Build.ps1 release
+      - name: Local integration
+        run: |
+          $binary = if ($IsWindows) { 'dist/omnidownloader.exe' } else { 'dist/omnidownloader' }
+          python scripts/verify.py --binary $binary --artifacts artifacts/integration
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_edges.py --binary $binary --artifacts artifacts/integration
+          exit $LASTEXITCODE
+      - name: Windows interactive terminal
+        if: runner.os == 'Windows'
+        run: |
+          python -m pip install pywinpty pyte Pillow
+          python scripts/verify_terminal.py --binary dist/omnidownloader.exe --artifacts artifacts/terminal
+      - name: Build artifacts and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omnidownloader-${{ matrix.os }}
+          path: |
+            dist/
+            artifacts/integration/*.json
+            artifacts/terminal/*.json
+            artifacts/terminal/terminal-*/*.png
+            artifacts/terminal/terminal-*/*.txt
