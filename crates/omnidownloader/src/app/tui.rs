@@ -94,8 +94,11 @@ enum Action {
     Help,
     Compose,
     ChooseCommand(usize),
+    Fill(String),
     QueueJob(String),
     Issues,
+    OpenFolder,
+    CopyPath,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +164,11 @@ fn command_match(query: &str, value: &str, summary: &str) -> bool {
                 chars.find(|candidate| *candidate == wanted).map(|_| chars)
             })
             .is_some()
+}
+
+// ponytail: global palette reuses the suggestion popup; no second palette system.
+fn palette_query(ui: &Ui) -> String {
+    ui.composer.trim().trim_start_matches('/').to_string()
 }
 #[derive(Clone)]
 struct Hit {
@@ -274,6 +282,7 @@ struct Ui {
     searching: bool,
     composer: String,
     composing: bool,
+    global: bool,
     command_cursor: usize,
     issues_only: bool,
     dialog: Option<Dialog>,
@@ -303,6 +312,7 @@ impl Ui {
             searching: false,
             composer: String::new(),
             composing: false,
+            global: false,
             command_cursor: 0,
             issues_only: false,
             dialog: None,
@@ -523,6 +533,98 @@ impl Ui {
             .collect();
         matches.sort_by_key(|(name, _)| !name.starts_with(input));
         matches
+    }
+    // ponytail: Ctrl+P palette is a filtered view over existing commands, jobs,
+    // files, accounts, and pages. No new navigation concepts.
+    fn palette_matches(&self) -> Vec<(String, &'static str, Action)> {
+        let query = palette_query(self);
+        let mut out: Vec<(String, &'static str, Action)> = Vec::new();
+        for (_, name, summary) in COMMANDS {
+            if command_match(&query, name, summary) {
+                out.push((
+                    format!("/{name} "),
+                    summary,
+                    Action::Fill(format!("/{name} ")),
+                ));
+            }
+        }
+        for job in self.snapshot.jobs.iter().take(30) {
+            if out.len() >= 14 {
+                break;
+            }
+            if command_match(&query, &job.title, job.status.label()) {
+                out.push((
+                    job.title.clone(),
+                    job.status.label(),
+                    Action::QueueJob(job.id.clone()),
+                ));
+            }
+        }
+        for job in self
+            .snapshot
+            .jobs
+            .iter()
+            .filter(|j| j.status == Status::Completed)
+            .take(3)
+        {
+            if out.len() >= 16 {
+                break;
+            }
+            let label = format!("library {}", job.title);
+            if command_match(&query, &label, "Browse completed files") {
+                out.push((
+                    label.clone(),
+                    "Browse completed files",
+                    Action::Fill(format!("/library {}", job.title)),
+                ));
+            }
+        }
+        for account in self.snapshot.accounts.iter().take(3) {
+            if out.len() >= 18 {
+                break;
+            }
+            if command_match(&query, &account.name, "Cookie account") {
+                out.push((
+                    format!("account {}", account.name),
+                    "Cookie account",
+                    Action::Page(Page::Accounts),
+                ));
+            }
+        }
+        for (label, summary, action) in [
+            (
+                "system doctor",
+                "Check optional dependencies",
+                Action::Doctor,
+            ),
+            (
+                "system settings",
+                "Edit paths and concurrency",
+                Action::Settings,
+            ),
+            (
+                "system worker",
+                "Show worker status",
+                Action::Page(Page::Tools),
+            ),
+            (
+                "queue issues",
+                "Show jobs needing attention",
+                Action::Issues,
+            ),
+        ] {
+            if out.len() >= 20 {
+                break;
+            }
+            if command_match(&query, label, summary) {
+                out.push((label.to_string(), summary, action));
+            }
+        }
+        out.truncate(10);
+        out
+    }
+    fn palette_open(&self) -> bool {
+        self.global && self.composing
     }
     fn open_add(&mut self, source: &str, immediate: bool) -> Result<()> {
         let mut form = self.form(FormKind::Add);
@@ -782,6 +884,7 @@ impl Ui {
         })();
         if result.is_ok() {
             self.composing = false;
+            self.global = false;
             self.composer.clear();
         }
         result
@@ -845,9 +948,12 @@ impl Ui {
             Action::Playlist(index)=>{if let Some(Dialog::Playlist{selected,cursor,..})=&mut self.dialog{*cursor=index;if !selected.insert(index+1){selected.remove(&(index+1));}}}
             Action::PlaylistAll=>{if let Some(Dialog::Playlist{info,selected,..})=&mut self.dialog{if selected.len()==info.entries.len(){selected.clear();}else{*selected=(1..=info.entries.len()).collect();}}}
             Action::ApplyPlaylist=>{if let Some(Dialog::Playlist{selected,mut form,..})=self.dialog.clone(){anyhow::ensure!(!selected.is_empty(),"Select at least one playlist entry");form.fields[6].value=selected.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");self.dialog=Some(Dialog::Form(form));}}
-            Action::Help=>self.info("Commands","Type / or press Ctrl+P\n\n/add       Download a URL or import a list\n/queue     View and control downloads\n/library   Browse completed files\n/convert   Convert a local media file\n/account   Manage cookie accounts\n/system    Tools, settings, plugins and worker\n/help      Commands and keyboard shortcuts\n/quit      Exit safely\n\nKeyboard\nArrows           Navigate\nEnter            Open or preview\nCtrl+Enter       Queue composer input immediately\nSpace            Select a job\np / r / x        Pause / resume / cancel\nEsc              Back\n\nClosing the terminal window directly leaves pending downloads running."),
-            Action::Compose=>{self.composing=true;self.focus=4;}
+            Action::Help=>self.info("Commands","Type / for commands or Ctrl+P for global search\n\n/add       Download a URL or import a list\n/queue     View and control downloads\n/library   Browse completed files\n/convert   Convert a local media file\n/account   Manage cookie accounts\n/system    Tools, settings, plugins and worker\n/help      Commands and keyboard shortcuts\n/quit      Exit safely\n\nKeyboard\nArrows           Navigate\nEnter            Open or preview\nCtrl+Enter       Queue composer input immediately\nSpace            Select a job\np / r / x        Pause / resume / cancel\nEsc              Back\n\nClosing the terminal window directly leaves pending downloads running."),
+            Action::Compose=>{self.composing=true;self.focus=4;self.global=false;}
             Action::ChooseCommand(index)=>{if let Some((value,_))=self.command_matches().get(index){self.composer=format!("/{value} ");self.command_cursor=0;self.composing=true;self.focus=4;}}
+            Action::Fill(value)=>{self.composer=value;self.command_cursor=0;self.composing=true;self.global=false;self.focus=4;}
+            Action::OpenFolder=>{if let Some(job)=self.visible().get(self.selected){self.info("Download folder",format!("{}\n\n{}",job.title,job.destination.display()));}}
+            Action::CopyPath=>{if let Some(job)=self.visible().get(self.selected){let path=job.files.first().map(|p|p.display().to_string()).unwrap_or_else(||job.destination.display().to_string());self.info("File path",format!("{path}\n\nSelect and copy it from here."));}}
             Action::QueueJob(id)=>{self.action(Action::Page(Page::Downloads))?;if let Some(index)=self.visible().iter().position(|job|job.id==id){self.selected=index;self.focus=2;}}
             Action::Issues=>{self.action(Action::Page(Page::Downloads))?;self.issues_only=true;}
         }
@@ -860,8 +966,12 @@ impl Ui {
             .rev()
             .find(|hit| hit.area.contains(position))
             .map(|hit| hit.action.clone());
-        if !matches!(action, Some(Action::Compose | Action::ChooseCommand(_))) {
+        if !matches!(
+            action,
+            Some(Action::Compose | Action::ChooseCommand(_) | Action::Fill(_))
+        ) {
             self.composing = false;
+            self.global = false;
         }
         if let Some(action) = action {
             self.action(action)?;
@@ -881,6 +991,8 @@ impl Ui {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
             self.composer = "/".into();
             self.composing = true;
+            self.global = true;
+            self.focus = 4;
             self.command_cursor = 0;
             return Ok(());
         }
@@ -888,34 +1000,60 @@ impl Ui {
             match key.code {
                 KeyCode::Esc => {
                     self.composing = false;
+                    self.global = false;
                     self.composer.clear();
                 }
                 KeyCode::Enter => {
-                    let suggestion = self
-                        .command_matches()
-                        .get(self.command_cursor)
-                        .map(|(value, _)| value.clone());
-                    if self.composer.starts_with('/')
-                        && suggestion
-                            .as_ref()
-                            .is_some_and(|value| self.composer.trim() != format!("/{value}"))
-                    {
-                        self.action(Action::ChooseCommand(self.command_cursor))?;
+                    if self.palette_open() {
+                        if let Some((_, _, action)) =
+                            self.palette_matches().get(self.command_cursor)
+                        {
+                            let action = action.clone();
+                            self.global = false;
+                            self.action(action)?;
+                        }
                     } else {
-                        self.run_composer(key.modifiers.contains(KeyModifiers::CONTROL))?;
+                        let suggestion = self
+                            .command_matches()
+                            .get(self.command_cursor)
+                            .map(|(value, _)| value.clone());
+                        if self.composer.starts_with('/')
+                            && suggestion
+                                .as_ref()
+                                .is_some_and(|value| self.composer.trim() != format!("/{value}"))
+                        {
+                            self.action(Action::ChooseCommand(self.command_cursor))?;
+                        } else {
+                            self.global = false;
+                            self.run_composer(key.modifiers.contains(KeyModifiers::CONTROL))?;
+                        }
                     }
                 }
                 KeyCode::Backspace => {
                     self.composer.pop();
                     self.command_cursor = 0;
                 }
+                KeyCode::Tab if self.palette_open() => {
+                    if let Some((_, _, action)) = self.palette_matches().get(self.command_cursor) {
+                        let action = action.clone();
+                        self.global = false;
+                        self.action(action)?;
+                    }
+                }
                 KeyCode::Tab if self.composer.starts_with('/') => {
                     if let Some((value, _)) = self.command_matches().get(self.command_cursor) {
                         self.composer = format!("/{value} ");
                     }
                 }
+                KeyCode::Up if self.palette_open() => {
+                    self.command_cursor = self.command_cursor.saturating_sub(1)
+                }
                 KeyCode::Up if self.composer.starts_with('/') => {
                     self.command_cursor = self.command_cursor.saturating_sub(1)
+                }
+                KeyCode::Down if self.palette_open() => {
+                    let len = self.palette_matches().len();
+                    self.command_cursor = (self.command_cursor + 1).min(len.saturating_sub(1));
                 }
                 KeyCode::Down if self.composer.starts_with('/') => {
                     let len = self.command_matches().len();
@@ -954,33 +1092,18 @@ impl Ui {
             KeyCode::Char('r') => self.action(Action::Resume)?,
             KeyCode::Char('x') => self.action(Action::Cancel)?,
             KeyCode::Tab => {
-                self.focus = if self.page == Page::Downloads {
-                    if self.focus == 4 {
-                        2
-                    } else {
-                        4
-                    }
-                } else {
-                    match self.focus {
-                        2 => 3,
-                        3 => 4,
-                        _ => 2,
-                    }
+                // ponytail: one focus cycle everywhere; Downloads action row is the selected card.
+                self.focus = match self.focus {
+                    2 => 3,
+                    3 => 4,
+                    _ => 2,
                 }
             }
             KeyCode::BackTab => {
-                self.focus = if self.page == Page::Downloads {
-                    if self.focus == 2 {
-                        4
-                    } else {
-                        2
-                    }
-                } else {
-                    match self.focus {
-                        4 => 3,
-                        3 => 2,
-                        _ => 4,
-                    }
+                self.focus = match self.focus {
+                    4 => 3,
+                    3 => 2,
+                    _ => 4,
                 }
             }
             KeyCode::Up => {
@@ -1213,16 +1336,29 @@ impl Ui {
                             form,
                         });
                     } else {
+                        let duration = info
+                            .duration
+                            .map(|n| format!("{:02}:{:02}", (n as u64) / 60, (n as u64) % 60))
+                            .unwrap_or_else(|| "Unknown length".into());
+                        let size = info
+                            .size
+                            .map(bytes)
+                            .unwrap_or_else(|| "Unknown size".into());
+                        let formats = if info.formats.is_empty() {
+                            "automatic quality".into()
+                        } else {
+                            info.formats
+                                .iter()
+                                .take(3)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(" · ")
+                        };
                         self.info(
                             "Media preview",
                             format!(
-                                "{}\n\nDuration: {}\nSize: {}\n\nFormats\n{}",
-                                info.title,
-                                info.duration
-                                    .map(|n| format!("{n:.0} seconds"))
-                                    .unwrap_or_else(|| "Unknown".into()),
-                                info.size.map(bytes).unwrap_or_else(|| "Unknown".into()),
-                                info.formats.join("\n")
+                                "{}\n{duration}  ·  {size}\n{formats}\n{}\n\nEnter back to options · Submit in the form queues it",
+                                info.title, info.source,
                             ),
                         );
                     }
@@ -1604,14 +1740,39 @@ fn draw_activity(frame: &mut Frame, ui: &mut Ui, area: Rect) {
         let message = if ui.issues_only {
             "Nothing needs attention."
         } else {
-            "Ready when you are. Paste a URL below to begin."
+            "No downloads"
         };
         text(
             frame,
-            Rect::new(area.x, area.y + 2, area.width, 2),
+            Rect::new(area.x, area.y + 2, area.width, 1),
             message,
             p.muted,
         );
+        // ponytail: one shortcut row reusing existing Add/Convert forms. No new concepts.
+        if !ui.issues_only && area.height >= 5 {
+            let items: [(&str, Action); 4] = [
+                ("many links", Action::Add),
+                ("open .torrent", Action::Add),
+                ("convert file", Action::Convert),
+                ("add options", Action::Add),
+            ];
+            let mut x = area.x;
+            for (label, action) in items {
+                let width = (label.len() as u16 + 3).min(area.right().saturating_sub(x));
+                if width < 5 {
+                    break;
+                }
+                button(
+                    frame,
+                    ui,
+                    Rect::new(x, area.y + 4, width, 1),
+                    label,
+                    action,
+                    false,
+                );
+                x += width + 1;
+            }
+        }
         return;
     }
     ui.selected = ui.selected.min(jobs.len() - 1);
@@ -1640,10 +1801,22 @@ fn draw_activity(frame: &mut Frame, ui: &mut Ui, area: Rect) {
             Rect::new(row.x + 1, row.y, row.width.saturating_sub(2), 1),
         );
         let meta = if job.status == Status::Active {
+            let total = job
+                .total
+                .filter(|t| *t > 0)
+                .map(bytes)
+                .unwrap_or_else(|| "—".into());
+            let eta = job
+                .eta
+                .map(|s| format!("{}:{:02}", s / 60, s % 60))
+                .unwrap_or_else(|| "—".into());
             format!(
-                "{}  {}/s",
+                "{}  {}/{}  {}/s  ETA {}",
                 job.status.label(),
-                bytes(job.speed.max(0.0) as u64)
+                bytes(job.downloaded),
+                total,
+                bytes(job.speed.max(0.0) as u64),
+                eta
             )
         } else {
             job.error
@@ -1671,6 +1844,52 @@ fn draw_activity(frame: &mut Frame, ui: &mut Ui, area: Rect) {
             area: row,
             action: Action::Row(index),
         });
+        // ponytail: status-specific actions share the same handlers as keyboard.
+        // They sit on the separator line so cards keep their 4-row rhythm.
+        if selected {
+            let items: &[(&str, Action)] = match job.status {
+                Status::Active => &[
+                    ("pause", Action::Pause),
+                    ("cancel", Action::Cancel),
+                    ("details", Action::Details),
+                ],
+                Status::Queued => &[
+                    ("pause", Action::Pause),
+                    ("cancel", Action::Cancel),
+                    ("details", Action::Details),
+                ],
+                Status::Paused => &[
+                    ("resume", Action::Resume),
+                    ("cancel", Action::Cancel),
+                    ("details", Action::Details),
+                ],
+                Status::Failed | Status::Cancelled => {
+                    &[("retry", Action::Retry), ("details", Action::Details)]
+                }
+                Status::Completed => &[
+                    ("details", Action::Details),
+                    ("folder", Action::OpenFolder),
+                    ("path", Action::CopyPath),
+                ],
+            };
+            let mut x = row.x + 1;
+            let y = row.y + 3;
+            for (position, (label, action)) in items.iter().enumerate() {
+                let width = (*label).len() as u16 + 3;
+                if x + width > row.right().saturating_sub(1) {
+                    break;
+                }
+                button(
+                    frame,
+                    ui,
+                    Rect::new(x, y, width, 1),
+                    label,
+                    action.clone(),
+                    ui.focus == 3 && ui.detail_focus == position,
+                );
+                x += width + 1;
+            }
+        }
     }
 }
 
@@ -1717,7 +1936,17 @@ fn draw_queue_rail(frame: &mut Frame, ui: &mut Ui, area: Rect) {
                 frame,
                 Rect::new(inner.x, y + 1, inner.width, 1),
                 if job.status == Status::Active {
-                    format!("Downloading  {}/s", bytes(job.speed.max(0.0) as u64))
+                    let total = job
+                        .total
+                        .filter(|t| *t > 0)
+                        .map(bytes)
+                        .unwrap_or_else(|| "—".into());
+                    format!(
+                        "{}/{} · {}/s",
+                        bytes(job.downloaded),
+                        total,
+                        bytes(job.speed.max(0.0) as u64)
+                    )
                 } else {
                     "Queued".into()
                 },
@@ -1794,14 +2023,71 @@ fn draw_composer(frame: &mut Frame, ui: &mut Ui, area: Rect) {
 }
 
 fn command_suggestion_height(ui: &Ui) -> u16 {
-    if ui.composing && ui.composer.starts_with('/') {
+    if ui.palette_open() {
+        (ui.palette_matches().len().min(5) as u16).saturating_add(1)
+    } else if ui.composing && ui.composer.starts_with('/') {
         (ui.command_matches().len().min(5) as u16).saturating_add(1)
     } else {
         0
     }
 }
 
+fn draw_suggestion_row(
+    frame: &mut Frame,
+    ui: &mut Ui,
+    row: Rect,
+    label: &str,
+    summary: &str,
+    selected: bool,
+    action: Action,
+) {
+    let p = ui.palette;
+    frame.render_widget(
+        Paragraph::new(format!("{label:<17} {summary}")).style(
+            Style::default()
+                .fg(if selected { p.fg } else { p.muted })
+                .bg(if selected { p.select } else { p.raised })
+                .add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+        row,
+    );
+    ui.hits.push(Hit { area: row, action });
+}
+
 fn draw_command_suggestions(frame: &mut Frame, ui: &mut Ui, area: Rect) {
+    let p = ui.palette;
+    if ui.palette_open() {
+        let matches = ui.palette_matches();
+        if matches.is_empty() || area.height < 2 {
+            return;
+        }
+        let popup = Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(1),
+        );
+        frame.render_widget(Block::default().style(Style::default().bg(p.raised)), popup);
+        let cursor = ui.command_cursor;
+        let start = cursor
+            .saturating_sub(4)
+            .min(matches.len().saturating_sub(5));
+        for (row_index, (index, (value, summary, action))) in matches
+            .into_iter()
+            .enumerate()
+            .skip(start)
+            .take(5)
+            .enumerate()
+        {
+            let row = Rect::new(popup.x + 1, popup.y + row_index as u16, popup.width - 2, 1);
+            draw_suggestion_row(frame, ui, row, &value, summary, index == cursor, action);
+        }
+        return;
+    }
     let matches = ui.command_matches();
     if matches.is_empty() || area.height < 2 {
         return;
@@ -1822,31 +2108,15 @@ fn draw_command_suggestions(frame: &mut Frame, ui: &mut Ui, area: Rect) {
         matches.iter().enumerate().skip(start).take(5).enumerate()
     {
         let row = Rect::new(popup.x + 1, popup.y + row_index as u16, popup.width - 2, 1);
-        frame.render_widget(
-            Paragraph::new(format!("/{value:<15} {summary}")).style(
-                Style::default()
-                    .fg(if index == ui.command_cursor {
-                        p.fg
-                    } else {
-                        p.muted
-                    })
-                    .bg(if index == ui.command_cursor {
-                        p.select
-                    } else {
-                        p.raised
-                    })
-                    .add_modifier(if index == ui.command_cursor {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
+        draw_suggestion_row(
+            frame,
+            ui,
             row,
+            &format!("/{value}"),
+            summary,
+            index == ui.command_cursor,
+            Action::ChooseCommand(index),
         );
-        ui.hits.push(Hit {
-            area: row,
-            action: Action::ChooseCommand(index),
-        });
     }
 }
 
@@ -1953,9 +2223,14 @@ fn draw(frame: &mut Frame, ui: &mut Ui) {
         .iter()
         .map(|job| job.speed.max(0.0) as u64)
         .sum();
-    text(
-        frame,
-        Rect::new(zones[2].x, zones[2].y, zones[2].width, 1),
+    // ponytail: one conditional warning in the existing status line. No setup wizard.
+    let missing: Vec<&str> = ui
+        .dependencies
+        .iter()
+        .filter(|d| d.path.is_none())
+        .map(|d| d.name.as_str())
+        .collect();
+    let status = if missing.is_empty() {
         format!(
             "{}  ·  {}  {active} active  {queued} queued  {}/s",
             ui.notice,
@@ -1965,13 +2240,28 @@ fn draw(frame: &mut Frame, ui: &mut Ui) {
                 "reconnecting"
             },
             bytes(rate)
-        ),
-        if ui.connected { p.muted } else { p.amber },
+        )
+    } else {
+        format!(
+            "{}  ·  {} missing  /system doctor  ·  {active} active  {queued} queued",
+            ui.notice,
+            missing.join(", "),
+        )
+    };
+    text(
+        frame,
+        Rect::new(zones[2].x, zones[2].y, zones[2].width, 1),
+        status,
+        if ui.connected && missing.is_empty() {
+            p.muted
+        } else {
+            p.amber
+        },
     );
     text(
         frame,
         Rect::new(zones[2].x, zones[2].y + 1, zones[2].width, 1),
-        "/queue  /library  /convert  /account  /system     ctrl+p commands",
+        "/queue  /library  /convert  /account  /system     ctrl+p search",
         p.muted,
     );
     if ui.dialog.is_some() {
@@ -2834,6 +3124,9 @@ mod tests {
         ui.action(Action::Page(Page::Downloads)).unwrap();
         ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
+        assert_eq!(ui.focus, 3);
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(ui.focus, 4);
     }
 
@@ -3265,5 +3558,137 @@ mod tests {
             .iter()
             .flat_map(|line| &line.spans)
             .any(|span| { span.style.bg.is_some_and(|color| color != palette.bg) }));
+    }
+
+    #[test]
+    fn empty_state_shows_shortcuts_routing_to_existing_forms() {
+        let (mut ui, _) = ui();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut ui)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("No downloads"));
+        assert!(!rendered.contains("Ready when you are"));
+        let adds = ui
+            .hits
+            .iter()
+            .filter(|h| matches!(h.action, Action::Add))
+            .count();
+        assert!(adds >= 3);
+        assert!(ui.hits.iter().any(|h| matches!(h.action, Action::Convert)));
+        ui.action(Action::Add).unwrap();
+        assert!(matches!(&ui.dialog, Some(Dialog::Form(f)) if f.kind == FormKind::Add));
+    }
+
+    #[test]
+    fn global_palette_finds_jobs_while_slash_stays_command_only() {
+        let (mut ui, _) = ui();
+        let mut active = job(1);
+        active.title = "Unique Lake Footage".into();
+        ui.snapshot.jobs = vec![active.clone()];
+        ui.composer = "/".into();
+        ui.composing = true;
+        ui.global = false;
+        assert!(ui
+            .command_matches()
+            .iter()
+            .all(|(v, _)| !v.contains("Lake")));
+        ui.global = true;
+        let palette = ui.palette_matches();
+        assert!(palette.iter().any(|(v, _, _)| v.contains("Lake")));
+        assert!(palette.iter().any(|(v, _, _)| v.starts_with("/add ")));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!ui.global);
+    }
+
+    #[test]
+    fn selected_cards_expose_status_actions_to_keyboard_and_mouse() {
+        let (mut ui, _) = ui();
+        let mut failed = job(1);
+        failed.status = Status::Failed;
+        let mut done = job(2);
+        done.status = Status::Completed;
+        ui.snapshot.jobs = vec![failed, done];
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        ui.issues_only = true;
+        terminal.draw(|frame| draw(frame, &mut ui)).unwrap();
+        assert!(ui.hits.iter().any(|h| matches!(h.action, Action::Retry)));
+        assert!(ui.hits.iter().any(|h| matches!(h.action, Action::Details)));
+        ui.issues_only = false;
+        ui.selected = 1;
+        terminal.draw(|frame| draw(frame, &mut ui)).unwrap();
+        assert!(ui
+            .hits
+            .iter()
+            .any(|h| matches!(h.action, Action::OpenFolder)));
+        assert!(ui.hits.iter().any(|h| matches!(h.action, Action::CopyPath)));
+        ui.action(Action::CopyPath).unwrap();
+        assert!(matches!(&ui.dialog, Some(Dialog::Info { .. })));
+        ui.dialog = None;
+        ui.focus = 3;
+        ui.detail_focus = 4;
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(&ui.dialog, Some(Dialog::Info { .. })));
+    }
+
+    #[test]
+    fn dependency_warning_only_shows_when_tools_are_missing() {
+        let (mut ui, _) = ui();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut ui)).unwrap();
+        let clean: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!clean.contains("missing"));
+        ui.dependencies = vec![Dependency {
+            name: "yt-dlp".into(),
+            path: None,
+            purpose: "".into(),
+            guidance: "".into(),
+        }];
+        terminal.draw(|frame| draw(frame, &mut ui)).unwrap();
+        let warned: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(warned.contains("yt-dlp missing"));
+        assert!(warned.contains("/system doctor"));
+    }
+
+    #[test]
+    fn active_cards_show_compact_size_speed_and_eta() {
+        let (mut ui, _) = ui();
+        let mut active = job(1);
+        active.status = Status::Active;
+        active.downloaded = 50;
+        active.total = Some(100);
+        active.speed = 10.0;
+        active.eta = Some(65);
+        ui.snapshot.jobs = vec![active];
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut ui)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("50 B/100 B"));
+        assert!(rendered.contains("ETA 1:05"));
     }
 }

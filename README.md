@@ -42,7 +42,7 @@ omnidownloader
 
 ## TUI
 
-Click the composer or press `/` to search commands. Arrow keys change the highlighted suggestion, Enter accepts it, and Enter again runs the completed command.
+Click the composer or press `/` to search commands. `Ctrl+P` searches everything: commands, downloads, library files, accounts, and system pages. Arrow keys move the highlight, Enter accepts it, Enter again runs it.
 
 ```text
 /add       Download a URL, magnet, torrent, or list
@@ -55,7 +55,7 @@ Click the composer or press `/` to search commands. Arrow keys change the highli
 /quit      Exit safely
 ```
 
-Pasting a URL opens a preview. Pasting a local media path opens conversion. `Ctrl+Enter` queues composer input immediately.
+Pasting a URL opens a compact preview. Pasting a local media path opens conversion. `Ctrl+Enter` queues composer input immediately. The empty screen offers shortcuts for batch lists, torrent files, conversion, and add options. Selected downloads expose their own actions for keyboard and mouse. Missing tools surface one warning line; healthy systems stay quiet.
 
 ## CLI Examples
 
