@@ -1,52 +1,106 @@
 # OmniDownloader
 
-OmniDownloader is an independently implemented Rust download manager. It is a separate project and does not fork or depend on OmniGet.
+<p align="center">
+  <img src="./omnidownloader-logo-shaded.svg" alt="OmniDownloader" width="900">
+</p>
 
-## Current scope
+<p align="center">
+  A terminal-first download manager with a persistent queue, background worker, and command-driven TUI.
+</p>
 
-The starter milestone includes:
+![OmniDownloader TUI](./tui-preview.svg)
 
-- A shared asynchronous engine and persistent SQLite queue.
-- Scriptable commands for downloads, inspection, batches, queue control, cookies, conversion, tools, and dependency checks.
-- A Ratatui/Crossterm dashboard entry point.
-- A local worker process with versioned JSON IPC.
-- Direct HTTP downloads, yt-dlp media jobs, FFmpeg conversion, and optional aria2 torrent jobs.
-- Redacted diagnostics and isolated application data under the selected profile.
+## Features
 
-Provider-specific authentication, broad course support, plugins, torrent behavior, and the full interactive dashboard still need deeper implementation and live validation.
+- Direct HTTP downloads with validated resume support and collision-safe output.
+- Video, audio, and playlist downloads through yt-dlp.
+- Media conversion through FFmpeg.
+- Optional torrent and magnet support through aria2.
+- Persistent SQLite queue shared by the TUI and scriptable CLI.
+- Background worker with cancellation, recovery, and concurrent clients.
+- Local cookie accounts, dependency diagnostics, and redacted logs.
+- Keyboard and mouse interaction with fuzzy slash-command suggestions.
 
-## Build on Windows
+## Install
 
-`Build.ps1` keeps Cargo build output on the spacious build drive and configures the Visual Studio toolchain used by this checkout:
+### Windows release
+
+Download `omnidownloader-windows-x86_64.exe` from the latest GitHub release, rename it to `omnidownloader.exe`, and place it in a directory on `PATH`.
+
+Then open the TUI from any terminal:
 
 ```powershell
-$env:OMNIDOWNLOADER_WINDOWS_SDK = 'Z:\BugSeed\.build\windows-sdk'
-.\Build.ps1 build
-.\Build.ps1 test
-.\Build.ps1 lint
+omnidownloader
 ```
 
-The binary is copied to `dist\omnidownloader.exe`.
-
-## Commands
+### Cargo
 
 ```text
+cargo install --git https://github.com/ASVLCII/OmniDownloader --locked
 omnidownloader
-omnidownloader download <url>
-omnidownloader info <url>
-omnidownloader batch <file>
-omnidownloader queue list|pause|resume|cancel|retry
-omnidownloader auth import-cookies <file>
-omnidownloader doctor
-omnidownloader worker status|stop
 ```
 
-Add `--json` for newline-delimited machine-readable output. Use `--data-dir <profile>` to keep a test profile separate from the default data directory.
+## TUI
 
-## Dependency discovery
+Click the composer or press `/` to search commands. Arrow keys change the highlighted suggestion, Enter accepts it, and Enter again runs the completed command.
 
-The application discovers configured tools through `PATH` and known executable locations. `doctor` reports the exact executable path or setup guidance. It does not install or update tools.
+```text
+/add       Download a URL, magnet, torrent, or list
+/queue     View and control downloads
+/library   Browse and export completed files
+/convert   Convert a local media file
+/account   Manage local cookie accounts
+/system    Check tools, settings, plugins, and worker status
+/help      Show commands and shortcuts
+/quit      Exit safely
+```
 
-## Verification boundary
+Pasting a URL opens a preview. Pasting a local media path opens conversion. `Ctrl+Enter` queues composer input immediately.
 
-The current verified checks are Windows build, formatting, Clippy with warnings denied, persistent-store tests, queue/worker CLI smoke tests, and dependency discovery. macOS/Linux builds, live provider downloads, terminal rendering, interruption/resume behavior, and background-worker failure recovery remain unverified.
+## CLI Examples
+
+```powershell
+omnidownloader download "https://example.com/file.zip" --direct --detach
+omnidownloader info "https://example.com/video"
+omnidownloader batch links.txt
+omnidownloader queue list
+omnidownloader queue pause <JOB_ID>
+omnidownloader queue resume <JOB_ID>
+omnidownloader auth import-cookies cookies.txt --name personal
+omnidownloader convert clip.mov --format mp4 --detach
+omnidownloader doctor
+omnidownloader worker status
+```
+
+Add `--json` for newline-delimited machine-readable output. Use `--data-dir <profile>` to isolate application data.
+
+## Optional Tools
+
+OmniDownloader discovers configured tools through `PATH` and known executable locations. It never silently installs or updates them.
+
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) for media sites and playlists
+- [FFmpeg](https://ffmpeg.org/) for conversion
+- [aria2](https://aria2.github.io/) for torrents and magnet links
+
+Run `omnidownloader doctor` or `/system doctor` to inspect the current setup.
+
+## Build
+
+```powershell
+$env:OMNIDOWNLOADER_WINDOWS_SDK = 'C:\path\to\Windows-SDK-Lib-version'
+.\Build.ps1 test
+.\Build.ps1 lint
+.\Build.ps1 release
+```
+
+The Windows binary is written to `dist\omnidownloader.exe`. Standard Cargo builds are used on Linux and macOS.
+
+## Verification
+
+The controlled test harness covers formatting, Clippy with warnings denied, unit and engine tests, direct HTTP integrity, redirects, resume validation, destination collisions, worker recovery, concurrent clients, subprocess cleanup, plugin boundaries, yt-dlp against local media, and real Windows ConPTY keyboard/mouse interaction.
+
+Live third-party providers, course adapters, browser callback authentication, and release packaging on every supported platform still require platform-specific validation.
+
+## License
+
+[MIT](./LICENSE)

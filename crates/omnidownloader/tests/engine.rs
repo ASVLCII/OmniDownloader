@@ -124,6 +124,28 @@ fn input_validation_rejects_bad_paths_and_flags() {
     s.options.playlist_items = Some("--exec evil".into());
     assert!(validate_spec(&s).is_err());
 }
+
+#[test]
+fn torrent_validation_accepts_supported_sources() {
+    let (dir, _) = setup();
+    let mut s = spec(dir.path());
+    s.kind = JobKind::Torrent;
+
+    s.source = "magnet:?xt=urn:btih:fixture".into();
+    validate_spec(&s).unwrap();
+
+    s.source = "https://example.com/file.torrent".into();
+    validate_spec(&s).unwrap();
+
+    s.source = "ftp://example.com/file.torrent".into();
+    assert!(validate_spec(&s).is_err());
+
+    let local = dir.path().join("FILE.TORRENT");
+    std::fs::write(&local, b"fixture").unwrap();
+    s.source = local.to_string_lossy().into();
+    validate_spec(&s).unwrap();
+}
+
 #[test]
 fn logs_redact_url_secrets() {
     let value = redact("Failed https://user:password@example.com/file?token=secret#fragment");

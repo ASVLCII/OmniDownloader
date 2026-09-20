@@ -50,7 +50,7 @@ def main():
         proc.fileobj.settimeout(.1)
         screen = pyte.Screen(120, 35)
         stream = pyte.Stream(screen)
-        wait_text("OMNIDOWNLOADER")
+        wait_text("Paste a URL, local file")
 
     def pump():
         try:
@@ -115,10 +115,9 @@ def main():
         cli("settings", "output", root / "downloads")
         start()
         capture("dashboard")
-        click("+ Add download")
-        wait_text("Add a download")
+        click("Paste a URL, local file")
         send("\x1b[200~" + base + "/file.bin" + "\x1b[201~")
-        click("Inspect")
+        send("\r")
         wait_text("Media preview")
         click("Close")
         wait_text(base)
@@ -128,7 +127,7 @@ def main():
         passed.append("Mouse add/inspect/return/submit and bracketed paste")
 
         send("?")
-        wait_text("Make yourself at home")
+        wait_text("Commands")
         send("\x1b")
         proc.setwinsize(20, 60)
         screen.resize(20, 60)

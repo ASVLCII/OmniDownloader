@@ -22,36 +22,15 @@ use tokio::sync::mpsc;
 enum Page {
     Downloads,
     Library,
-    Courses,
-    Convert,
     Tools,
     Accounts,
-    Settings,
 }
-const PAGES: [Page; 7] = [
-    Page::Downloads,
-    Page::Library,
-    Page::Courses,
-    Page::Convert,
-    Page::Tools,
-    Page::Accounts,
-    Page::Settings,
-];
 impl Page {
     fn actions(self) -> Vec<(&'static str, Action)> {
         match self {
             Self::Library => vec![
                 ("Details", Action::Details),
                 ("Export library", Action::Export),
-            ],
-            Self::Courses => vec![
-                ("Add course", Action::Add),
-                ("Import cookies", Action::Import),
-                ("Details", Action::Details),
-            ],
-            Self::Convert => vec![
-                ("Convert a file", Action::Convert),
-                ("Details", Action::Details),
             ],
             Self::Tools => vec![
                 ("Check tools", Action::Doctor),
@@ -62,7 +41,6 @@ impl Page {
                 ("Udemy login", Action::Login("udemy".into())),
                 ("Hotmart login", Action::Login("hotmart".into())),
             ],
-            Self::Settings => vec![("Edit settings", Action::Settings)],
             Self::Downloads => vec![
                 ("Pause", Action::Pause),
                 ("Resume", Action::Resume),
@@ -76,11 +54,8 @@ impl Page {
         match self {
             Self::Downloads => "Downloads",
             Self::Library => "Library",
-            Self::Courses => "Courses",
-            Self::Convert => "Convert",
             Self::Tools => "Tools",
             Self::Accounts => "Accounts",
-            Self::Settings => "Settings",
         }
     }
 }
@@ -117,6 +92,75 @@ enum Action {
     Login(String),
     Export,
     Help,
+    Compose,
+    ChooseCommand(usize),
+    QueueJob(String),
+    Issues,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlashCommand {
+    Add,
+    Queue,
+    Library,
+    Convert,
+    Account,
+    System,
+    Help,
+    Quit,
+}
+const COMMANDS: [(SlashCommand, &str, &str); 8] = [
+    (SlashCommand::Add, "add", "Download a URL or import a list"),
+    (SlashCommand::Queue, "queue", "View and control downloads"),
+    (SlashCommand::Library, "library", "Browse completed files"),
+    (
+        SlashCommand::Convert,
+        "convert",
+        "Convert a local media file",
+    ),
+    (SlashCommand::Account, "account", "Manage cookie accounts"),
+    (
+        SlashCommand::System,
+        "system",
+        "Tools, settings, plugins and worker",
+    ),
+    (
+        SlashCommand::Help,
+        "help",
+        "Commands and keyboard shortcuts",
+    ),
+    (SlashCommand::Quit, "quit", "Exit safely"),
+];
+
+fn parse_command(input: &str) -> Result<(SlashCommand, &str)> {
+    let input = input.trim();
+    let command = input.strip_prefix('/').context("Commands start with /")?;
+    let (name, rest) = command
+        .split_once(char::is_whitespace)
+        .unwrap_or((command, ""));
+    let command = COMMANDS
+        .iter()
+        .find(|(_, candidate, _)| *candidate == name)
+        .map(|(command, _, _)| *command)
+        .with_context(|| {
+            format!("Unknown command /{name}. Type /help to see available commands.")
+        })?;
+    Ok((command, rest.trim()))
+}
+
+fn command_match(query: &str, value: &str, summary: &str) -> bool {
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let candidate = format!("{value} {summary}").to_lowercase();
+    candidate.contains(&query)
+        || query
+            .chars()
+            .try_fold(candidate.chars(), |mut chars, wanted| {
+                chars.find(|candidate| *candidate == wanted).map(|_| chars)
+            })
+            .is_some()
 }
 #[derive(Clone)]
 struct Hit {
@@ -165,6 +209,10 @@ enum Dialog {
     },
     Restart {
         ids: Vec<String>,
+        action: Control,
+    },
+    RemoveAccount {
+        name: String,
     },
 }
 #[derive(Clone, Copy)]
@@ -199,17 +247,17 @@ impl Palette {
             };
         }
         Self {
-            bg: Color::Rgb(11, 16, 23),
-            panel: Color::Rgb(16, 23, 33),
-            raised: Color::Rgb(23, 33, 46),
-            fg: Color::Rgb(225, 234, 243),
-            muted: Color::Rgb(129, 148, 168),
-            line: Color::Rgb(42, 57, 74),
-            cyan: Color::Rgb(70, 213, 222),
-            green: Color::Rgb(105, 209, 157),
-            amber: Color::Rgb(239, 193, 112),
-            red: Color::Rgb(241, 128, 136),
-            select: Color::Rgb(24, 61, 73),
+            bg: Color::Rgb(18, 17, 15),
+            panel: Color::Rgb(24, 23, 20),
+            raised: Color::Rgb(36, 34, 29),
+            fg: Color::Rgb(226, 222, 211),
+            muted: Color::Rgb(145, 140, 128),
+            line: Color::Rgb(58, 55, 48),
+            cyan: Color::Rgb(150, 174, 145),
+            green: Color::Rgb(132, 168, 132),
+            amber: Color::Rgb(204, 167, 106),
+            red: Color::Rgb(207, 122, 112),
+            select: Color::Rgb(45, 50, 41),
         }
     }
 }
@@ -224,6 +272,10 @@ struct Ui {
     detail_focus: usize,
     search: String,
     searching: bool,
+    composer: String,
+    composing: bool,
+    command_cursor: usize,
+    issues_only: bool,
     dialog: Option<Dialog>,
     return_form: Option<Form>,
     hits: Vec<Hit>,
@@ -249,6 +301,10 @@ impl Ui {
             detail_focus: 0,
             search: String::new(),
             searching: false,
+            composer: String::new(),
+            composing: false,
+            command_cursor: 0,
+            issues_only: false,
             dialog: None,
             return_form: None,
             hits: vec![],
@@ -274,12 +330,6 @@ impl Ui {
             .filter(|j| {
                 let page = match self.page {
                     Page::Library => j.status == Status::Completed,
-                    Page::Convert => j.spec.kind == JobKind::Convert,
-                    Page::Courses => {
-                        j.spec.source.contains("udemy.com")
-                            || j.spec.source.contains("hotmart.com")
-                            || matches!(&j.spec.kind,JobKind::Plugin(id) if id=="telegram")
-                    }
                     _ => true,
                 };
                 let tab = if self.page == Page::Library {
@@ -295,11 +345,27 @@ impl Ui {
                         _ => true,
                     }
                 } else {
+                    if self.issues_only {
+                        return page
+                            && matches!(
+                                j.status,
+                                Status::Paused | Status::Failed | Status::Cancelled
+                            )
+                            && (search.is_empty()
+                                || j.title.to_lowercase().contains(&search)
+                                || j.destination
+                                    .to_string_lossy()
+                                    .to_lowercase()
+                                    .contains(&search));
+                    }
                     match self.tab {
                         1 => j.status == Status::Active,
-                        2 => j.status == Status::Queued || j.status == Status::Paused,
+                        2 => j.status == Status::Queued,
                         3 => j.status == Status::Completed,
-                        _ => true,
+                        _ => !matches!(
+                            j.status,
+                            Status::Paused | Status::Failed | Status::Cancelled
+                        ),
                     }
                 };
                 page && tab
@@ -395,6 +461,331 @@ impl Ui {
             action: 0,
         }
     }
+    fn command_matches(&self) -> Vec<(String, &'static str)> {
+        let input = self.composer.trim_start_matches('/');
+        if let Some((command, rest)) = input.split_once(char::is_whitespace) {
+            let options: &[(&str, &str)] = match command {
+                "queue" => &[
+                    ("active", "Show active downloads"),
+                    ("queued", "Show queued downloads"),
+                    ("completed", "Show completed downloads"),
+                    ("issues", "Show jobs needing attention"),
+                    ("pause", "Pause selected downloads"),
+                    ("pause all", "Pause every active or queued download"),
+                    ("resume", "Resume selected paused downloads"),
+                    ("resume all", "Resume all paused downloads"),
+                    ("cancel", "Cancel selected downloads"),
+                    ("cancel all", "Cancel all pending downloads"),
+                    ("retry", "Retry selected failed downloads"),
+                    ("retry all", "Retry all failed or cancelled downloads"),
+                ],
+                "library" => &[
+                    ("music", "Show saved audio"),
+                    ("books", "Show saved books"),
+                    ("export", "Export the library as JSON"),
+                ],
+                "account" => &[
+                    ("import", "Import Netscape cookies"),
+                    ("login udemy", "Open Udemy sign-in"),
+                    ("login hotmart", "Open Hotmart sign-in"),
+                    ("remove", "Remove a cookie account"),
+                ],
+                "system" => &[
+                    ("doctor", "Check optional dependencies"),
+                    ("settings", "Edit paths and concurrency"),
+                    ("plugins", "List installed plugins"),
+                    ("plugins add", "Register a plugin manifest"),
+                    ("worker", "Show worker status"),
+                ],
+                "help" => &[
+                    ("add", "Help for /add"),
+                    ("queue", "Help for /queue"),
+                    ("library", "Help for /library"),
+                    ("convert", "Help for /convert"),
+                    ("account", "Help for /account"),
+                    ("system", "Help for /system"),
+                ],
+                _ => &[],
+            };
+            let rest = rest.trim_start();
+            let mut matches: Vec<_> = options
+                .iter()
+                .filter(|(value, summary)| command_match(rest, value, summary))
+                .map(|(value, summary)| (format!("{command} {value}"), *summary))
+                .collect();
+            matches.sort_by_key(|(value, _)| !value[command.len() + 1..].starts_with(rest));
+            return matches;
+        }
+        let mut matches: Vec<_> = COMMANDS
+            .iter()
+            .filter(|(_, name, summary)| command_match(input, name, summary))
+            .map(|(_, name, summary)| ((*name).to_string(), *summary))
+            .collect();
+        matches.sort_by_key(|(name, _)| !name.starts_with(input));
+        matches
+    }
+    fn open_add(&mut self, source: &str, immediate: bool) -> Result<()> {
+        let mut form = self.form(FormKind::Add);
+        let source_path = Path::new(source);
+        form.fields[0].value = if source_path.is_file()
+            && source_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("txt"))
+        {
+            anyhow::ensure!(
+                std::fs::metadata(source_path)?.len() <= 8 * 1024 * 1024,
+                "Download list exceeds 8 MB"
+            );
+            std::fs::read_to_string(source_path)
+                .context("Cannot read download list")?
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            source.to_string()
+        };
+        let specs = form_specs(&form)?;
+        self.dialog = Some(Dialog::Form(form));
+        if immediate || specs.len() > 1 || specs[0].kind == JobKind::Torrent {
+            self.send(Request::Submit(specs), "submitted");
+        } else {
+            self.send(Request::Inspect(specs[0].clone()), "inspect");
+            self.notice = "Inspecting media...".into();
+        }
+        Ok(())
+    }
+    fn open_convert(&mut self, source: &str, immediate: bool) -> Result<()> {
+        let mut form = self.form(FormKind::Convert);
+        form.fields[0].value = source.to_string();
+        if immediate && !source.is_empty() {
+            let specs = form_specs(&form)?;
+            self.dialog = Some(Dialog::Form(form));
+            self.send(Request::Submit(specs), "submitted");
+        } else {
+            self.dialog = Some(Dialog::Form(form));
+        }
+        Ok(())
+    }
+    fn queue_control(&mut self, action: Control, all: bool) -> Result<()> {
+        let eligible = |status: &Status| match action {
+            Control::Pause => matches!(status, Status::Queued | Status::Active),
+            Control::Resume => *status == Status::Paused,
+            Control::Cancel => matches!(status, Status::Queued | Status::Active | Status::Paused),
+            Control::Retry => matches!(status, Status::Failed | Status::Cancelled),
+        };
+        let requested = if all {
+            self.snapshot
+                .jobs
+                .iter()
+                .map(|job| job.id.clone())
+                .collect()
+        } else {
+            self.ids()
+        };
+        anyhow::ensure!(!requested.is_empty(), "Select a download first");
+        let ids: Vec<_> = requested
+            .into_iter()
+            .filter(|id| {
+                self.snapshot
+                    .jobs
+                    .iter()
+                    .find(|job| job.id == *id)
+                    .is_some_and(|job| eligible(&job.status))
+            })
+            .collect();
+        anyhow::ensure!(
+            !ids.is_empty(),
+            "No selected downloads can be {}",
+            match action {
+                Control::Pause => "paused",
+                Control::Resume => "resumed",
+                Control::Cancel => "cancelled",
+                Control::Retry => "retried",
+            }
+        );
+        if matches!(action, Control::Resume | Control::Retry)
+            && self
+                .snapshot
+                .jobs
+                .iter()
+                .any(|job| ids.contains(&job.id) && !job.resume_supported && job.downloaded > 0)
+        {
+            self.dialog = Some(Dialog::Restart { ids, action });
+        } else {
+            self.send(
+                Request::Control {
+                    ids,
+                    action,
+                    allow_restart: false,
+                },
+                "control",
+            );
+        }
+        Ok(())
+    }
+    fn run_queue_command(&mut self, rest: &str) -> Result<()> {
+        let words: Vec<_> = rest.split_whitespace().collect();
+        match words.as_slice() {
+            [] => self.action(Action::Page(Page::Downloads)),
+            [filter @ ("active" | "queued" | "completed" | "issues")] => {
+                self.action(Action::Page(Page::Downloads))?;
+                self.issues_only = *filter == "issues";
+                self.tab = match *filter {
+                    "active" => 1,
+                    "queued" => 2,
+                    "completed" => 3,
+                    _ => 0,
+                };
+                Ok(())
+            }
+            [operation @ ("pause" | "resume" | "cancel" | "retry")]
+            | [operation @ ("pause" | "resume" | "cancel" | "retry"), "all"] => {
+                if self.page != Page::Downloads {
+                    self.action(Action::Page(Page::Downloads))?;
+                }
+                let action = match *operation {
+                    "pause" => Control::Pause,
+                    "resume" => Control::Resume,
+                    "cancel" => Control::Cancel,
+                    _ => Control::Retry,
+                };
+                self.queue_control(action, words.get(1) == Some(&"all"))
+            }
+            _ => anyhow::bail!(
+                "Usage: /queue [active|queued|completed|issues|pause|resume|cancel|retry] [all]"
+            ),
+        }
+    }
+    fn run_account_command(&mut self, rest: &str) -> Result<()> {
+        let words: Vec<_> = rest.split_whitespace().collect();
+        match words.as_slice() {
+            [] => self.action(Action::Page(Page::Accounts)),
+            ["import"] => self.action(Action::Import),
+            ["login", provider @ ("udemy" | "hotmart")] => {
+                self.action(Action::Login((*provider).into()))
+            }
+            ["remove", name] => {
+                crate::engine::paths::validate_name(name)?;
+                anyhow::ensure!(
+                    self.snapshot
+                        .accounts
+                        .iter()
+                        .any(|account| account.name == *name),
+                    "Unknown account {name}"
+                );
+                self.dialog = Some(Dialog::RemoveAccount {
+                    name: (*name).into(),
+                });
+                Ok(())
+            }
+            _ => anyhow::bail!("Usage: /account [import|login udemy|login hotmart|remove NAME]"),
+        }
+    }
+    fn run_system_command(&mut self, rest: &str) -> Result<()> {
+        match rest {
+            "" => self.action(Action::Page(Page::Tools)),
+            "doctor" => self.action(Action::Doctor),
+            "settings" => self.action(Action::Settings),
+            "plugins" => {
+                self.action(Action::Page(Page::Tools))?;
+                self.send(Request::Plugins, "plugins");
+                Ok(())
+            }
+            "plugins add" => self.action(Action::Plugin),
+            "worker" => {
+                self.info(
+                    "Download worker",
+                    format!(
+                        "Status: {}\nProcess: {}\n\nDownloads continue when the TUI closes. Use /quit to choose whether active transfers keep running.",
+                        if self.connected { "Connected" } else { "Reconnecting" },
+                        self.snapshot.worker_pid
+                    ),
+                );
+                Ok(())
+            }
+            _ => anyhow::bail!("Usage: /system [doctor|settings|plugins|plugins add|worker]"),
+        }
+    }
+    fn run_help_command(&mut self, topic: &str) -> Result<()> {
+        if topic.is_empty() {
+            return self.action(Action::Help);
+        }
+        let text = match topic {
+            "add" => "/add [URL|MAGNET|TORRENT|LIST]\n\nPreview one URL, or queue a list, magnet, or torrent. Pasting a source without /add does the same thing.",
+            "queue" => "/queue [active|queued|completed|issues]\n/queue pause|resume|cancel|retry [all]\n\nWithout all, the action applies to marked jobs or the selected job.",
+            "library" => "/library [music|books|SEARCH|export]\n\nBrowse, filter, search, or export completed downloads.",
+            "convert" => "/convert [FILE]\n\nOpen conversion settings for a local media file.",
+            "account" => "/account [import|login udemy|login hotmart|remove NAME]\n\nCookie values are never displayed.",
+            "system" => "/system [doctor|settings|plugins|plugins add|worker]\n\nInspect dependencies and configure local tools.",
+            "help" => "/help [COMMAND]\n\nShow general or command-specific help.",
+            "quit" => "/quit\n\nChoose whether active downloads keep running.",
+            _ => anyhow::bail!("Unknown help topic {topic}"),
+        };
+        self.info(&format!("/{topic}"), text);
+        Ok(())
+    }
+    fn run_composer(&mut self, immediate: bool) -> Result<()> {
+        let input = self.composer.trim().to_string();
+        anyhow::ensure!(!input.is_empty(), "Paste a URL, local file, or type /");
+        let result = (|| {
+            let source_path = Path::new(&input);
+            if source_path.is_file() {
+                let add = source_path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| {
+                        value.eq_ignore_ascii_case("txt") || value.eq_ignore_ascii_case("torrent")
+                    });
+                return if add {
+                    self.open_add(&input, immediate)
+                } else {
+                    self.open_convert(&input, immediate)
+                };
+            }
+            if input.starts_with('/') {
+                let (command, rest) = parse_command(&input)?;
+                match command {
+                    SlashCommand::Add => {
+                        if rest.is_empty() {
+                            self.action(Action::Add)?;
+                        } else {
+                            self.open_add(rest, immediate)?;
+                        }
+                    }
+                    SlashCommand::Queue => self.run_queue_command(rest)?,
+                    SlashCommand::Library => {
+                        self.action(Action::Page(Page::Library))?;
+                        self.search.clear();
+                        match rest {
+                            "music" => self.tab = 1,
+                            "books" => self.tab = 2,
+                            "export" => self.action(Action::Export)?,
+                            "" => {}
+                            query => self.search = query.to_string(),
+                        }
+                    }
+                    SlashCommand::Convert => self.open_convert(rest, immediate)?,
+                    SlashCommand::Account => self.run_account_command(rest)?,
+                    SlashCommand::System => self.run_system_command(rest)?,
+                    SlashCommand::Help => self.run_help_command(rest)?,
+                    SlashCommand::Quit => {
+                        anyhow::ensure!(rest.is_empty(), "Usage: /quit");
+                        self.action(Action::Quit)?;
+                    }
+                }
+                return Ok(());
+            }
+            self.open_add(&input, immediate)
+        })();
+        if result.is_ok() {
+            self.composing = false;
+            self.composer.clear();
+        }
+        result
+    }
     fn info(&mut self, title: &str, text: impl Into<String>) {
         if let Some(Dialog::Form(form)) = &self.dialog {
             self.return_form = Some(form.clone());
@@ -407,7 +798,7 @@ impl Ui {
     }
     fn action(&mut self, action: Action) -> Result<()> {
         match action {
-            Action::Page(page)=>{self.page=page;self.detail_focus=0;self.tab=0;self.selected=0;self.marked.clear();self.table=TableState::default();self.focus=2;}
+            Action::Page(page)=>{self.page=page;self.detail_focus=0;self.tab=0;self.selected=0;self.marked.clear();self.table=TableState::default();self.focus=2;self.issues_only=false;self.search.clear();self.searching=false;}
             Action::Tab(tab)=>{self.tab=tab;self.selected=0;self.table=TableState::default();}
             Action::Row(row)=>{self.selected=row;self.focus=2;}
             Action::Mark(row)=>{self.selected=row;self.focus=2;if let Some(job)=self.visible().get(row){if !self.marked.insert(job.id.clone()){self.marked.remove(&job.id);}}}
@@ -424,12 +815,10 @@ impl Ui {
             Action::Search=>{self.searching=true;self.focus=1;}
             Action::Details=>{if let Some(job)=self.visible().get(self.selected){self.info("Download details",format!("{}\n\nStatus: {}\nSaved: {}\nDestination: {}\n\n{}\n\nFiles\n{}",job.title,job.status.label(),bytes(job.downloaded),job.destination.display(),job.error.as_deref().unwrap_or("No errors reported."),job.files.iter().map(|p|p.display().to_string()).collect::<Vec<_>>().join("\n")));}}
             Action::Pause|Action::Resume|Action::Cancel|Action::Retry=>{
-                let ids=self.ids();if ids.is_empty(){self.notice="Select a download first.".into();return Ok(());}
                 let control=match action{Action::Pause=>Control::Pause,Action::Resume=>Control::Resume,Action::Retry=>Control::Retry,_=>Control::Cancel};
-                if matches!(control,Control::Resume|Control::Retry)&&self.snapshot.jobs.iter().any(|j|ids.contains(&j.id)&&!j.resume_supported&&j.downloaded>0){self.dialog=Some(Dialog::Restart{ids});}
-                else{self.send(Request::Control{ids,action:control,allow_restart:false},"control");}
+                self.queue_control(control,false)?;
             }
-            Action::Doctor=>{self.send(Request::Doctor,"doctor");self.send(Request::Plugins,"plugins");}
+            Action::Doctor=>{if self.page != Page::Tools { self.action(Action::Page(Page::Tools))?; } self.send(Request::Doctor,"doctor");self.send(Request::Plugins,"plugins");}
             Action::Login(provider)=>{super::open_login(&provider)?;self.info("Finish connecting your account","Sign in in your browser, export Netscape cookies.txt, then choose Import cookies here. Opening the browser alone does not authenticate OmniDownloader.");}
             Action::Field(index)=>{if let Some(Dialog::Form(form))=&mut self.dialog{form.focus=index;}}
             Action::Toggle(index)=>{if let Some(Dialog::Form(form))=&mut self.dialog{form.focus=index;let value=&mut form.fields[index].value;*value=if value=="true"{"false"}else{"true"}.into();}}
@@ -437,7 +826,8 @@ impl Ui {
                 if let Some(Dialog::Form(form))=&self.dialog {let specs=form_specs(form)?;anyhow::ensure!(specs.len()==1,"Inspect one URL at a time");self.send(Request::Inspect(specs[0].clone()),"inspect");self.notice="Inspecting media… you can keep browsing.".into();}
             }
             Action::Submit=>{
-                if matches!(self.dialog,Some(Dialog::Restart{..})){if let Some(Dialog::Restart{ids})=self.dialog.take(){self.send(Request::Control{ids,action:Control::Resume,allow_restart:true},"control");return Ok(());}}
+                if matches!(self.dialog,Some(Dialog::RemoveAccount{..})){if let Some(Dialog::RemoveAccount{name})=self.dialog.take(){self.send(Request::RemoveAccount(name),"account-removed");return Ok(());}}
+                if matches!(self.dialog,Some(Dialog::Restart{..})){if let Some(Dialog::Restart{ids,action})=self.dialog.take(){self.send(Request::Control{ids,action,allow_restart:true},"control");return Ok(());}}
                 if let Some(Dialog::Form(form))=self.dialog.clone(){
                     match form.kind {
                         FormKind::Add|FormKind::Convert=>{let specs=form_specs(&form)?;self.send(Request::Submit(specs),"submitted");}
@@ -455,7 +845,26 @@ impl Ui {
             Action::Playlist(index)=>{if let Some(Dialog::Playlist{selected,cursor,..})=&mut self.dialog{*cursor=index;if !selected.insert(index+1){selected.remove(&(index+1));}}}
             Action::PlaylistAll=>{if let Some(Dialog::Playlist{info,selected,..})=&mut self.dialog{if selected.len()==info.entries.len(){selected.clear();}else{*selected=(1..=info.entries.len()).collect();}}}
             Action::ApplyPlaylist=>{if let Some(Dialog::Playlist{selected,mut form,..})=self.dialog.clone(){anyhow::ensure!(!selected.is_empty(),"Select at least one playlist entry");form.fields[6].value=selected.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");self.dialog=Some(Dialog::Form(form));}}
-            Action::Help=>self.info("Make yourself at home","Mouse\nClick navigation, tabs, rows, fields and buttons. Scroll lists with the wheel.\n\nKeyboard\nTab / Shift+Tab  Change focus\nArrows           Navigate\nEnter            Activate / inspect selected item\nSpace            Select a job or toggle a checkbox\na                Add download\nc                Convert a file\np / r / x        Pause / resume / cancel selected jobs\n/                Search\n?                This guide\nq / Ctrl+C       Exit dialog\nEsc              Back\n\nSelect several jobs with Space, then pause, resume or cancel them together.\nClosing the terminal window directly leaves pending downloads running."),
+            Action::Help=>self.info("Commands","Type / or press Ctrl+P\n\n/add       Download a URL or import a list\n/queue     View and control downloads\n/library   Browse completed files\n/convert   Convert a local media file\n/account   Manage cookie accounts\n/system    Tools, settings, plugins and worker\n/help      Commands and keyboard shortcuts\n/quit      Exit safely\n\nKeyboard\nArrows           Navigate\nEnter            Open or preview\nCtrl+Enter       Queue composer input immediately\nSpace            Select a job\np / r / x        Pause / resume / cancel\nEsc              Back\n\nClosing the terminal window directly leaves pending downloads running."),
+            Action::Compose=>{self.composing=true;self.focus=4;}
+            Action::ChooseCommand(index)=>{if let Some((value,_))=self.command_matches().get(index){self.composer=format!("/{value} ");self.command_cursor=0;self.composing=true;self.focus=4;}}
+            Action::QueueJob(id)=>{self.action(Action::Page(Page::Downloads))?;if let Some(index)=self.visible().iter().position(|job|job.id==id){self.selected=index;self.focus=2;}}
+            Action::Issues=>{self.action(Action::Page(Page::Downloads))?;self.issues_only=true;}
+        }
+        Ok(())
+    }
+    fn click(&mut self, position: Position) -> Result<()> {
+        let action = self
+            .hits
+            .iter()
+            .rev()
+            .find(|hit| hit.area.contains(position))
+            .map(|hit| hit.action.clone());
+        if !matches!(action, Some(Action::Compose | Action::ChooseCommand(_))) {
+            self.composing = false;
+        }
+        if let Some(action) = action {
+            self.action(action)?;
         }
         Ok(())
     }
@@ -468,6 +877,57 @@ impl Ui {
         }
         if self.dialog.is_some() {
             return self.dialog_key(key);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+            self.composer = "/".into();
+            self.composing = true;
+            self.command_cursor = 0;
+            return Ok(());
+        }
+        if self.composing {
+            match key.code {
+                KeyCode::Esc => {
+                    self.composing = false;
+                    self.composer.clear();
+                }
+                KeyCode::Enter => {
+                    let suggestion = self
+                        .command_matches()
+                        .get(self.command_cursor)
+                        .map(|(value, _)| value.clone());
+                    if self.composer.starts_with('/')
+                        && suggestion
+                            .as_ref()
+                            .is_some_and(|value| self.composer.trim() != format!("/{value}"))
+                    {
+                        self.action(Action::ChooseCommand(self.command_cursor))?;
+                    } else {
+                        self.run_composer(key.modifiers.contains(KeyModifiers::CONTROL))?;
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.composer.pop();
+                    self.command_cursor = 0;
+                }
+                KeyCode::Tab if self.composer.starts_with('/') => {
+                    if let Some((value, _)) = self.command_matches().get(self.command_cursor) {
+                        self.composer = format!("/{value} ");
+                    }
+                }
+                KeyCode::Up if self.composer.starts_with('/') => {
+                    self.command_cursor = self.command_cursor.saturating_sub(1)
+                }
+                KeyCode::Down if self.composer.starts_with('/') => {
+                    let len = self.command_matches().len();
+                    self.command_cursor = (self.command_cursor + 1).min(len.saturating_sub(1));
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.composer.push(c);
+                    self.command_cursor = 0;
+                }
+                _ => {}
+            }
+            return Ok(());
         }
         if self.searching {
             match key.code {
@@ -486,45 +946,53 @@ impl Ui {
             KeyCode::Char('?') => self.action(Action::Help)?,
             KeyCode::Char('a') => self.action(Action::Add)?,
             KeyCode::Char('c') => self.action(Action::Convert)?,
-            KeyCode::Char('/') => self.action(Action::Search)?,
+            KeyCode::Char('/') => {
+                self.composer = "/".into();
+                self.action(Action::Compose)?;
+            }
             KeyCode::Char('p') => self.action(Action::Pause)?,
             KeyCode::Char('r') => self.action(Action::Resume)?,
             KeyCode::Char('x') => self.action(Action::Cancel)?,
-            KeyCode::Tab => self.focus = (self.focus + 1) % 5,
-            KeyCode::BackTab => self.focus = (self.focus + 4) % 5,
-            KeyCode::Up => {
-                if self.focus == 0 {
-                    let index = PAGES.iter().position(|p| *p == self.page).unwrap_or(0);
-                    self.action(Action::Page(PAGES[index.saturating_sub(1)]))?;
-                    self.focus = 0;
+            KeyCode::Tab => {
+                self.focus = if self.page == Page::Downloads {
+                    if self.focus == 4 {
+                        2
+                    } else {
+                        4
+                    }
                 } else {
-                    self.selected = self.selected.saturating_sub(1);
+                    match self.focus {
+                        2 => 3,
+                        3 => 4,
+                        _ => 2,
+                    }
                 }
+            }
+            KeyCode::BackTab => {
+                self.focus = if self.page == Page::Downloads {
+                    if self.focus == 2 {
+                        4
+                    } else {
+                        2
+                    }
+                } else {
+                    match self.focus {
+                        4 => 3,
+                        3 => 2,
+                        _ => 4,
+                    }
+                }
+            }
+            KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
             }
             KeyCode::Down => {
-                if self.focus == 0 {
-                    let index = PAGES.iter().position(|p| *p == self.page).unwrap_or(0);
-                    self.action(Action::Page(PAGES[(index + 1).min(6)]))?;
-                    self.focus = 0;
-                } else {
-                    self.selected = (self.selected + 1).min(self.visible().len().saturating_sub(1));
-                }
+                self.selected = (self.selected + 1).min(self.visible().len().saturating_sub(1));
             }
-            KeyCode::Left => {
-                if self.focus == 1 {
-                    self.action(Action::Tab(self.tab.saturating_sub(1)))?;
-                } else if self.focus == 3 {
-                    self.detail_focus = self.detail_focus.saturating_sub(1);
-                }
-            }
+            KeyCode::Left => self.detail_focus = self.detail_focus.saturating_sub(1),
             KeyCode::Right => {
-                if self.focus == 1 {
-                    self.action(Action::Tab(
-                        (self.tab + 1).min(if self.page == Page::Library { 2 } else { 3 }),
-                    ))?;
-                } else if self.focus == 3 {
-                    self.detail_focus = (self.detail_focus + 1).min(self.page.actions().len() - 1);
-                }
+                self.detail_focus =
+                    (self.detail_focus + 1).min(self.page.actions().len().saturating_sub(1));
             }
             KeyCode::Char(' ') => {
                 if let Some(job) = self.visible().get(self.selected) {
@@ -535,14 +1003,13 @@ impl Ui {
             }
             KeyCode::Enter => {
                 if self.focus == 4 {
-                    self.action(Action::Add)?;
+                    self.action(Action::Compose)?;
                 } else if self.focus == 3 {
                     if let Some((_, action)) = self.page.actions().get(self.detail_focus) {
                         self.action(action.clone())?;
                     }
                 } else {
                     match self.page {
-                        Page::Settings => self.action(Action::Settings)?,
                         Page::Accounts => self.action(Action::Import)?,
                         Page::Tools => self.action(Action::Doctor)?,
                         _ => self.action(Action::Details)?,
@@ -583,6 +1050,11 @@ impl Ui {
                 _ => {}
             },
             Dialog::Restart { .. } => {
+                if key.code == KeyCode::Enter {
+                    action = Some(Action::Submit)
+                }
+            }
+            Dialog::RemoveAccount { .. } => {
                 if key.code == KeyCode::Enter {
                     action = Some(Action::Submit)
                 }
@@ -676,10 +1148,13 @@ impl Ui {
             }
         } else if self.searching {
             self.search.push_str(&text);
+        } else if self.composing {
+            self.composer.push_str(&text.replace('\r', ""));
+            self.command_cursor = 0;
         } else {
-            let mut form = self.form(FormKind::Add);
-            form.fields[0].value = text.trim().into();
-            self.dialog = Some(Dialog::Form(form));
+            self.composer = text.trim().into();
+            self.composing = true;
+            self.focus = 4;
         }
     }
     fn response(&mut self, tag: String, result: Result<serde_json::Value>) {
@@ -758,12 +1233,21 @@ impl Ui {
                 self.dialog = None;
                 self.page = Page::Downloads;
                 self.tab = 0;
+                self.selected = 0;
+                self.marked.clear();
+                self.search.clear();
+                self.searching = false;
+                self.issues_only = false;
                 self.notice = "Added to your queue. Downloads continue in the background.".into();
             }
             "account" => {
                 self.dialog = None;
                 self.notice =
                     "Cookies imported. The account is ready for supported sources.".into();
+            }
+            "account-removed" => {
+                self.dialog = None;
+                self.notice = "Account removed from this profile.".into();
             }
             "settings" => {
                 self.dialog = None;
@@ -821,10 +1305,30 @@ fn form_specs(form: &Form) -> Result<Vec<JobSpec>> {
         .lines()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|source| JobSpec {
-            source: source.into(),
-            kind: JobKind::Download,
-            options: options.clone(),
+        .map(|source| {
+            let torrent = source.starts_with("magnet:")
+                || Path::new(source)
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("torrent"))
+                || url::Url::parse(source)
+                    .ok()
+                    .and_then(|url| {
+                        Path::new(url.path())
+                            .extension()
+                            .and_then(|value| value.to_str())
+                            .map(|value| value.eq_ignore_ascii_case("torrent"))
+                    })
+                    .unwrap_or(false);
+            JobSpec {
+                source: source.into(),
+                kind: if torrent {
+                    JobKind::Torrent
+                } else {
+                    JobKind::Download
+                },
+                options: options.clone(),
+            }
         })
         .collect();
     anyhow::ensure!(!specs.is_empty(), "Paste at least one URL");
@@ -905,17 +1409,7 @@ pub async fn run(paths: Paths, mut client: Client) -> Result<()> {
                     }
                     Event::Mouse(mouse) => match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
-                            let hit = ui
-                                .hits
-                                .iter()
-                                .rev()
-                                .find(|h| h.area.contains(Position::new(mouse.column, mouse.row)))
-                                .map(|h| h.action.clone());
-                            if let Some(action) = hit {
-                                ui.action(action)
-                            } else {
-                                Ok(())
-                            }
+                            ui.click(Position::new(mouse.column, mouse.row))
                         }
                         MouseEventKind::ScrollDown => {
                             ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
@@ -982,7 +1476,7 @@ fn panel(title: &str, p: Palette, focused: bool) -> Block<'_> {
             })),
         )
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Plain)
         .border_style(Style::default().fg(if focused { p.cyan } else { p.line }))
         .style(Style::default().bg(p.panel))
 }
@@ -1006,6 +1500,356 @@ fn text(frame: &mut Frame, area: Rect, value: impl Into<String>, color: Color) {
     );
 }
 
+fn logo_pattern(c: char) -> [&'static str; 5] {
+    match c {
+        'o' => ["111", "101", "101", "101", "111"],
+        'm' => ["10001", "11011", "10101", "10001", "10001"],
+        'n' => ["1001", "1101", "1011", "1001", "1001"],
+        'i' => ["111", "010", "010", "010", "111"],
+        'd' => ["110", "101", "101", "101", "110"],
+        'w' => ["10001", "10001", "10101", "10101", "01010"],
+        'l' => ["100", "100", "100", "100", "111"],
+        'a' => ["010", "101", "111", "101", "101"],
+        'e' => ["111", "100", "110", "100", "111"],
+        'r' => ["110", "101", "110", "101", "101"],
+        _ => ["", "", "", "", ""],
+    }
+}
+
+fn logo_color(p: Palette, letter: usize, row: usize, column: usize, width: usize) -> Color {
+    if p.bg == Color::Reset {
+        return p.fg;
+    }
+    if letter >= 4 {
+        return p.fg;
+    }
+    match row {
+        0 => Color::Rgb(150, 150, 145),
+        4 => Color::Rgb(98, 98, 95),
+        _ if column == 0 => Color::Rgb(133, 133, 128),
+        _ if column + 1 == width => Color::Rgb(112, 112, 108),
+        _ => Color::Rgb(122, 122, 117),
+    }
+}
+
+fn logo_lines(p: Palette) -> Vec<Line<'static>> {
+    let word = "omnidownloader";
+    (0..5)
+        .map(|row| {
+            let mut spans = Vec::new();
+            for (letter, c) in word.chars().enumerate() {
+                let pattern = logo_pattern(c);
+                for column in 0..pattern[0].len() {
+                    let filled = pattern[row].as_bytes()[column] == b'1';
+                    let color = logo_color(p, letter, row, column, pattern[0].len());
+                    spans.push(if filled {
+                        if p.bg == Color::Reset {
+                            Span::styled("██", Style::default().fg(color))
+                        } else {
+                            Span::styled("  ", Style::default().bg(color))
+                        }
+                    } else {
+                        Span::styled("  ", Style::default().bg(p.bg))
+                    });
+                }
+                spans.push(Span::styled(" ", Style::default().bg(p.bg)));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn progress_line(job: &Job, width: u16, p: Palette) -> Line<'static> {
+    let percent = if job.status == Status::Completed {
+        Some(100.0)
+    } else {
+        job.total
+            .filter(|total| *total > 0)
+            .map(|total| (job.downloaded as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+    };
+    let bar_width = width.saturating_sub(8) as usize;
+    let filled = percent
+        .map(|value| (value / 100.0 * bar_width as f64).round() as usize)
+        .unwrap_or(0)
+        .min(bar_width);
+    let fill = if p.bg == Color::Reset {
+        Span::styled("█".repeat(filled), Style::default().fg(p.fg))
+    } else {
+        Span::styled(" ".repeat(filled), Style::default().bg(p.fg))
+    };
+    let suffix = if job.status == Status::Completed {
+        " Saved".into()
+    } else if let Some(percent) = percent {
+        format!(" {percent:>3.0}%")
+    } else {
+        String::new()
+    };
+    Line::from(vec![
+        fill,
+        Span::styled(" ".repeat(bar_width - filled), Style::default().bg(p.bg)),
+        Span::styled("|", Style::default().fg(p.fg).bold()),
+        Span::styled(suffix, Style::default().fg(p.muted)),
+    ])
+}
+
+fn draw_activity(frame: &mut Frame, ui: &mut Ui, area: Rect) {
+    let p = ui.palette;
+    let jobs = ui.visible();
+    let title = if ui.issues_only { "ISSUES" } else { "ACTIVITY" };
+    frame.render_widget(
+        Paragraph::new(title).style(Style::default().fg(p.muted).bold()),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    if jobs.is_empty() {
+        let message = if ui.issues_only {
+            "Nothing needs attention."
+        } else {
+            "Ready when you are. Paste a URL below to begin."
+        };
+        text(
+            frame,
+            Rect::new(area.x, area.y + 2, area.width, 2),
+            message,
+            p.muted,
+        );
+        return;
+    }
+    ui.selected = ui.selected.min(jobs.len() - 1);
+    let capacity = (area.height.saturating_sub(2) / 4).max(1) as usize;
+    let start = ui.selected.saturating_sub(capacity - 1);
+    for (visible_row, (index, job)) in jobs
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(capacity)
+        .enumerate()
+    {
+        let y = area.y + 2 + visible_row as u16 * 4;
+        let selected = index == ui.selected;
+        let row = Rect::new(
+            area.x,
+            y,
+            area.width,
+            3.min(area.bottom().saturating_sub(y)),
+        );
+        if selected {
+            frame.render_widget(Block::default().style(Style::default().bg(p.select)), row);
+        }
+        frame.render_widget(
+            Paragraph::new(&*job.title).style(Style::default().fg(p.fg).bold()),
+            Rect::new(row.x + 1, row.y, row.width.saturating_sub(2), 1),
+        );
+        let meta = if job.status == Status::Active {
+            format!(
+                "{}  {}/s",
+                job.status.label(),
+                bytes(job.speed.max(0.0) as u64)
+            )
+        } else {
+            job.error
+                .as_deref()
+                .unwrap_or_else(|| job.status.label())
+                .to_string()
+        };
+        text(
+            frame,
+            Rect::new(row.x + 1, row.y + 1, row.width.saturating_sub(2), 1),
+            meta,
+            if matches!(job.status, Status::Failed | Status::Cancelled) {
+                p.red
+            } else if job.status == Status::Paused {
+                p.amber
+            } else {
+                p.muted
+            },
+        );
+        frame.render_widget(
+            Paragraph::new(progress_line(job, row.width.saturating_sub(2), p)),
+            Rect::new(row.x + 1, row.y + 2, row.width.saturating_sub(2), 1),
+        );
+        ui.hits.push(Hit {
+            area: row,
+            action: Action::Row(index),
+        });
+    }
+}
+
+fn draw_queue_rail(frame: &mut Frame, ui: &mut Ui, area: Rect) {
+    let p = ui.palette;
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(p.line)),
+        area,
+    );
+    let inner = area.inner(Margin::new(2, 0));
+    text(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        "QUEUE",
+        p.muted,
+    );
+    let jobs: Vec<_> = ui
+        .snapshot
+        .jobs
+        .iter()
+        .filter(|job| matches!(job.status, Status::Active | Status::Queued))
+        .collect();
+    if jobs.is_empty() {
+        text(
+            frame,
+            Rect::new(inner.x, inner.y + 2, inner.width, 2),
+            "Queue is empty.\nType /add to begin.",
+            p.muted,
+        );
+    } else {
+        for (row, job) in jobs
+            .iter()
+            .take((inner.height.saturating_sub(5) / 4) as usize)
+            .enumerate()
+        {
+            let y = inner.y + 2 + row as u16 * 4;
+            frame.render_widget(
+                Paragraph::new(&*job.title).style(Style::default().fg(p.fg).bold()),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            text(
+                frame,
+                Rect::new(inner.x, y + 1, inner.width, 1),
+                if job.status == Status::Active {
+                    format!("Downloading  {}/s", bytes(job.speed.max(0.0) as u64))
+                } else {
+                    "Queued".into()
+                },
+                p.muted,
+            );
+            frame.render_widget(
+                Paragraph::new(progress_line(job, inner.width, p)),
+                Rect::new(inner.x, y + 2, inner.width, 1),
+            );
+            ui.hits.push(Hit {
+                area: Rect::new(inner.x, y, inner.width, 3),
+                action: Action::QueueJob(job.id.clone()),
+            });
+        }
+    }
+    let issues = ui
+        .snapshot
+        .jobs
+        .iter()
+        .filter(|job| {
+            matches!(
+                job.status,
+                Status::Paused | Status::Failed | Status::Cancelled
+            )
+        })
+        .count();
+    if issues > 0 {
+        let area = Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 1);
+        text(
+            frame,
+            area,
+            format!("{issues} need attention  /queue issues"),
+            p.amber,
+        );
+        ui.hits.push(Hit {
+            area,
+            action: Action::Issues,
+        });
+    }
+}
+
+fn draw_composer(frame: &mut Frame, ui: &mut Ui, area: Rect) {
+    let p = ui.palette;
+    frame.render_widget(Block::default().style(Style::default().bg(p.panel)), area);
+    let value = if ui.composer.is_empty() {
+        if ui.composing {
+            ">  _".to_string()
+        } else {
+            "Paste a URL, local file, or type /".to_string()
+        }
+    } else {
+        format!(">  {}{}", ui.composer, if ui.composing { "_" } else { "" })
+    };
+    text(
+        frame,
+        Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), 1),
+        value,
+        if ui.composer.is_empty() && !ui.composing {
+            p.muted
+        } else {
+            p.fg
+        },
+    );
+    text(
+        frame,
+        Rect::new(area.x + 1, area.y + 2, area.width.saturating_sub(2), 1),
+        "Enter preview   Ctrl+Enter queue now   Esc clear",
+        p.muted,
+    );
+    ui.hits.push(Hit {
+        area,
+        action: Action::Compose,
+    });
+}
+
+fn command_suggestion_height(ui: &Ui) -> u16 {
+    if ui.composing && ui.composer.starts_with('/') {
+        (ui.command_matches().len().min(5) as u16).saturating_add(1)
+    } else {
+        0
+    }
+}
+
+fn draw_command_suggestions(frame: &mut Frame, ui: &mut Ui, area: Rect) {
+    let matches = ui.command_matches();
+    if matches.is_empty() || area.height < 2 {
+        return;
+    }
+    let p = ui.palette;
+    let popup = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(1),
+    );
+    frame.render_widget(Block::default().style(Style::default().bg(p.raised)), popup);
+    let start = ui
+        .command_cursor
+        .saturating_sub(4)
+        .min(matches.len().saturating_sub(5));
+    for (row_index, (index, (value, summary))) in
+        matches.iter().enumerate().skip(start).take(5).enumerate()
+    {
+        let row = Rect::new(popup.x + 1, popup.y + row_index as u16, popup.width - 2, 1);
+        frame.render_widget(
+            Paragraph::new(format!("/{value:<15} {summary}")).style(
+                Style::default()
+                    .fg(if index == ui.command_cursor {
+                        p.fg
+                    } else {
+                        p.muted
+                    })
+                    .bg(if index == ui.command_cursor {
+                        p.select
+                    } else {
+                        p.raised
+                    })
+                    .add_modifier(if index == ui.command_cursor {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            row,
+        );
+        ui.hits.push(Hit {
+            area: row,
+            action: Action::ChooseCommand(index),
+        });
+    }
+}
+
 fn draw(frame: &mut Frame, ui: &mut Ui) {
     let p = ui.palette;
     let area = frame.area();
@@ -1018,206 +1862,121 @@ fn draw(frame: &mut Frame, ui: &mut Ui) {
         text(
             frame,
             area,
-            "OmniDownloader\nEnlarge the terminal to at least 42 × 12.\nPress q to exit.",
+            "OmniDownloader\nEnlarge the terminal to at least 42 x 12.\nPress q to exit.",
             p.fg,
         );
         return;
     }
     let root = area.inner(Margin::new(2, 1));
+    let show_logo = ui.page == Page::Downloads && area.height >= 20 && root.width >= 110;
     let zones = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(if show_logo { 6 } else { 2 }),
         Constraint::Min(5),
         Constraint::Length(2),
-        Constraint::Length(1),
     ])
     .split(root);
-    let header = Layout::horizontal([
-        Constraint::Min(10),
-        Constraint::Length(20),
-        Constraint::Length(4),
-    ])
-    .spacing(2)
-    .split(zones[0]);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("OMNI", Style::default().fg(p.cyan).bold()),
-                Span::styled("DOWNLOADER", Style::default().fg(p.fg).bold()),
-            ]),
-            Line::from(Span::styled(
-                "Your downloads. Your space.",
-                Style::default().fg(p.muted),
-            )),
-        ]),
-        header[0],
-    );
-    button(
-        frame,
-        ui,
-        Rect::new(header[1].x, header[1].y, header[1].width, 1),
-        "+ Add download",
-        Action::Add,
-        ui.focus == 4,
-    );
-    button(
-        frame,
-        ui,
-        Rect::new(header[2].x, header[2].y, header[2].width, 1),
-        " ? ",
-        Action::Help,
-        false,
-    );
-    let main = if area.width >= 82 {
-        let columns = Layout::horizontal([Constraint::Length(20), Constraint::Min(10)])
+    if show_logo {
+        frame.render_widget(
+            Paragraph::new(logo_lines(p)).alignment(Alignment::Center),
+            zones[0],
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("omni", Style::default().fg(p.muted).bold()),
+                Span::styled("downloader", Style::default().fg(p.fg).bold()),
+            ])),
+            zones[0],
+        );
+    }
+    let content = if area.width >= 96 && matches!(ui.page, Page::Downloads | Page::Library) {
+        let columns = Layout::horizontal([Constraint::Min(48), Constraint::Length(34)])
             .spacing(2)
             .split(zones[1]);
-        draw_sidebar(frame, ui, columns[0]);
-        columns[1]
+        draw_queue_rail(frame, ui, columns[1]);
+        columns[0]
     } else {
-        let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(3)]).split(zones[1]);
-        let width = (rows[0].width / 7).max(1);
-        for (i, page) in PAGES.iter().enumerate() {
-            button(
-                frame,
-                ui,
-                Rect::new(
-                    rows[0].x + i as u16 * width,
-                    rows[0].y,
-                    width.saturating_sub(1),
-                    1,
-                ),
-                &page.label()[..4],
-                Action::Page(*page),
-                *page == ui.page,
-            );
-        }
-        rows[1]
+        zones[1]
     };
-    match ui.page {
-        Page::Tools => draw_tools(frame, ui, main),
-        Page::Accounts => draw_accounts(frame, ui, main),
-        Page::Settings => draw_settings(frame, ui, main),
-        _ => draw_downloads(frame, ui, main),
+    let suggestions = command_suggestion_height(ui);
+    if ui.page == Page::Downloads {
+        let jobs = ui.visible().len() as u16;
+        let desired = if jobs == 0 {
+            5
+        } else {
+            2u16.saturating_add(jobs.saturating_mul(4))
+        };
+        let activity_height = desired
+            .min(content.height.saturating_sub(4 + suggestions))
+            .max(1);
+        let rows = Layout::vertical([
+            Constraint::Length(activity_height),
+            Constraint::Length(suggestions),
+            Constraint::Length(4),
+            Constraint::Min(0),
+        ])
+        .split(content);
+        draw_activity(frame, ui, rows[0]);
+        draw_command_suggestions(frame, ui, rows[1]);
+        draw_composer(frame, ui, rows[2]);
+    } else {
+        let rows = Layout::vertical([
+            Constraint::Min(5),
+            Constraint::Length(suggestions),
+            Constraint::Length(4),
+        ])
+        .split(content);
+        match ui.page {
+            Page::Tools => draw_tools(frame, ui, rows[0]),
+            Page::Accounts => draw_accounts(frame, ui, rows[0]),
+            Page::Library => draw_downloads(frame, ui, rows[0]),
+            Page::Downloads => unreachable!(),
+        }
+        draw_command_suggestions(frame, ui, rows[1]);
+        draw_composer(frame, ui, rows[2]);
     }
-    let count = ui
+    let active = ui
         .snapshot
         .jobs
         .iter()
-        .filter(|j| j.status == Status::Active)
+        .filter(|job| job.status == Status::Active)
         .count();
     let queued = ui
         .snapshot
         .jobs
         .iter()
-        .filter(|j| j.status == Status::Queued)
+        .filter(|job| job.status == Status::Queued)
         .count();
-    let rate = ui
+    let rate: u64 = ui
         .snapshot
         .jobs
         .iter()
-        .map(|j| j.speed.max(0.0) as u64)
+        .map(|job| job.speed.max(0.0) as u64)
         .sum();
-    let status = if ui.connected {
-        "Connected"
-    } else {
-        "Reconnecting"
-    };
     text(
         frame,
-        Rect::new(zones[2].x, zones[2].y, zones[2].width.saturating_sub(9), 1),
+        Rect::new(zones[2].x, zones[2].y, zones[2].width, 1),
         format!(
-            "{}  ·  {count} active  ·  {queued} queued  ·  {}/s",
-            status,
+            "{}  ·  {}  {active} active  {queued} queued  {}/s",
+            ui.notice,
+            if ui.connected {
+                "connected"
+            } else {
+                "reconnecting"
+            },
             bytes(rate)
         ),
-        if ui.connected { p.green } else { p.amber },
-    );
-    button(
-        frame,
-        ui,
-        Rect::new(zones[2].right().saturating_sub(8), zones[2].y, 8, 1),
-        "Quit  q",
-        Action::Quit,
-        false,
+        if ui.connected { p.muted } else { p.amber },
     );
     text(
         frame,
         Rect::new(zones[2].x, zones[2].y + 1, zones[2].width, 1),
-        &ui.notice,
-        p.muted,
-    );
-    text(
-        frame,
-        zones[3],
-        "Tab focus   Enter open   Space select   / search   ? help",
+        "/queue  /library  /convert  /account  /system     ctrl+p commands",
         p.muted,
     );
     if ui.dialog.is_some() {
         ui.hits.clear();
         draw_dialog(frame, ui, area);
-    }
-}
-fn draw_sidebar(frame: &mut Frame, ui: &mut Ui, area: Rect) {
-    let p = ui.palette;
-    frame.render_widget(Block::default().style(Style::default().bg(p.panel)), area);
-    text(
-        frame,
-        Rect::new(area.x + 2, area.y + 1, area.width.saturating_sub(4), 1),
-        "WORKSPACE",
-        p.muted,
-    );
-    for (i, page) in PAGES.iter().enumerate() {
-        let row = Rect::new(
-            area.x + 1,
-            area.y + 3 + i as u16 * 2,
-            area.width.saturating_sub(2),
-            1,
-        );
-        if row.y >= area.bottom().saturating_sub(1) {
-            break;
-        }
-        let selected = *page == ui.page;
-        let label = format!("{} {}", if selected { "▎" } else { " " }, page.label());
-        frame.render_widget(
-            Paragraph::new(label).style(
-                Style::default()
-                    .fg(if selected { p.cyan } else { p.muted })
-                    .bg(if selected { p.select } else { p.panel })
-                    .add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            row,
-        );
-        ui.hits.push(Hit {
-            area: row,
-            action: Action::Page(*page),
-        });
-    }
-    if area.height > 21 {
-        let done = ui
-            .snapshot
-            .jobs
-            .iter()
-            .filter(|j| j.status == Status::Completed)
-            .count();
-        text(
-            frame,
-            Rect::new(
-                area.x + 2,
-                area.bottom() - 4,
-                area.width.saturating_sub(4),
-                3,
-            ),
-            format!(
-                "{} saved\nLocal. Independent.\nv{}",
-                done,
-                env!("CARGO_PKG_VERSION")
-            ),
-            p.muted,
-        );
     }
 }
 fn draw_downloads(frame: &mut Frame, ui: &mut Ui, area: Rect) {
@@ -1238,9 +1997,7 @@ fn draw_downloads(frame: &mut Frame, ui: &mut Ui, area: Rect) {
     .split(area);
     let subtitle = match ui.page {
         Page::Library => "Everything you have saved, in one place.",
-        Page::Courses => "Udemy: experimental · Hotmart adapter planned",
-        Page::Convert => "Transform media without leaving your terminal.",
-        _ => "A little less waiting. A lot more saved.",
+        _ => "Downloads stay available when you leave this screen.",
     };
     text(
         frame,
@@ -1291,8 +2048,7 @@ fn draw_downloads(frame: &mut Frame, ui: &mut Ui, area: Rect) {
     }
     let table_area = rows[2];
     if jobs.is_empty() {
-        frame.render_widget(panel("Your queue", p, ui.focus == 2), table_area);
-        let content = table_area.inner(Margin::new(3, 2));
+        let content = table_area.inner(Margin::new(1, 1));
         let (title, body) = if !ui.search.is_empty() {
             (
                 "No matching downloads",
@@ -1300,14 +2056,10 @@ fn draw_downloads(frame: &mut Frame, ui: &mut Ui, area: Rect) {
             )
         } else if ui.page == Page::Library {
             ("A home for everything you save","Completed downloads appear here automatically.\nSearch your music, books, videos and files.")
-        } else if ui.page == Page::Courses {
-            ("Course downloads","Udemy uses experimental yt-dlp routing with imported cookies.\nHotmart and Telegram account adapters are planned.\nLive course access has not been verified.")
-        } else if ui.page == Page::Convert {
-            ("Give your media a new format","Convert a video, extract audio, or save a still image.\nYour original file stays intact.")
         } else {
             ("Your next download starts here","Paste a link anywhere on this screen, or choose\n+ Add download to set quality and destination.")
         };
-        text(frame, content, format!("\n{title}\n\n{body}"), p.muted);
+        text(frame, content, format!("{title}\n\n{body}"), p.muted);
     } else {
         ui.selected = ui.selected.min(jobs.len() - 1);
         ui.table.select(Some(ui.selected));
@@ -1518,7 +2270,7 @@ fn draw_tools(frame: &mut Frame, ui: &mut Ui, area: Rect) {
         Rect::new(inner.x, y, 14, 1),
         "Check tools",
         Action::Doctor,
-        false,
+        ui.focus == 3 && ui.detail_focus == 0,
     );
     button(
         frame,
@@ -1526,7 +2278,7 @@ fn draw_tools(frame: &mut Frame, ui: &mut Ui, area: Rect) {
         Rect::new(inner.x + 16, y, 14, 1),
         "Add plugin",
         Action::Plugin,
-        false,
+        ui.focus == 3 && ui.detail_focus == 1,
     );
 }
 fn draw_accounts(frame: &mut Frame, ui: &mut Ui, area: Rect) {
@@ -1571,7 +2323,7 @@ fn draw_accounts(frame: &mut Frame, ui: &mut Ui, area: Rect) {
         Rect::new(inner.x, y, 18, 1),
         "Import cookies",
         Action::Import,
-        true,
+        ui.focus == 3 && ui.detail_focus == 0,
     );
     let y = inner.bottom().saturating_sub(1);
     button(
@@ -1580,7 +2332,7 @@ fn draw_accounts(frame: &mut Frame, ui: &mut Ui, area: Rect) {
         Rect::new(inner.x, y, 15, 1),
         "Udemy login",
         Action::Login("udemy".into()),
-        false,
+        ui.focus == 3 && ui.detail_focus == 1,
     );
     button(
         frame,
@@ -1588,22 +2340,7 @@ fn draw_accounts(frame: &mut Frame, ui: &mut Ui, area: Rect) {
         Rect::new(inner.x + 17, y, 15, 1),
         "Hotmart login",
         Action::Login("hotmart".into()),
-        false,
-    );
-}
-fn draw_settings(frame: &mut Frame, ui: &mut Ui, area: Rect) {
-    let p = ui.palette;
-    frame.render_widget(panel("Settings", p, false), area);
-    let inner = area.inner(Margin::new(2, 1));
-    let settings = &ui.snapshot.settings;
-    text(frame,inner,format!("Make room for your workflow.\n\nDefault destination\n{}\n\nConcurrent downloads\n{} at a time\n\nBackground downloads\nContinue by default. Choose otherwise in the exit dialog.\n\nAppearance\nDark slate + cyan. Set NO_COLOR for monochrome.\n\nNo automatic startup. No silent dependency updates.",settings.output.display(),settings.concurrency),p.muted);
-    button(
-        frame,
-        ui,
-        Rect::new(inner.x, inner.bottom().saturating_sub(1), 18, 1),
-        "Edit settings",
-        Action::Settings,
-        true,
+        ui.focus == 3 && ui.detail_focus == 2,
     );
 }
 fn draw_dialog(frame: &mut Frame, ui: &mut Ui, screen: Rect) {
@@ -1904,6 +2641,36 @@ fn draw_dialog(frame: &mut Frame, ui: &mut Ui, screen: Rect) {
                 true,
             );
         }
+        Dialog::RemoveAccount { name } => {
+            let area = centered(screen, 58, 10);
+            frame.render_widget(Clear, area);
+            frame.render_widget(panel("Remove account", p, true), area);
+            let inner = area.inner(Margin::new(3, 2));
+            text(
+                frame,
+                inner,
+                format!(
+                    "Remove {name} from this profile?\n\nThe imported cookie file will be deleted."
+                ),
+                p.fg,
+            );
+            button(
+                frame,
+                ui,
+                Rect::new(area.right() - 28, area.bottom() - 3, 12, 1),
+                "Cancel",
+                Action::Close,
+                false,
+            );
+            button(
+                frame,
+                ui,
+                Rect::new(area.right() - 14, area.bottom() - 3, 11, 1),
+                "Remove",
+                Action::Submit,
+                true,
+            );
+        }
     }
 }
 
@@ -1984,14 +2751,28 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_activates_the_visible_page_action() {
+    fn commands_are_small_and_unambiguous() {
+        for (command, name, _) in COMMANDS {
+            assert_eq!(parse_command(&format!("/{name}")).unwrap().0, command);
+        }
+        assert!(parse_command("/doctor").is_err());
+        assert!(parse_command("queue").is_err());
+        assert_eq!(parse_command("/queue issues").unwrap().1, "issues");
+        let (mut ui, _) = ui();
+        ui.composer = "/unknown".into();
+        ui.composing = true;
+        assert!(ui.run_composer(false).is_err());
+        assert_eq!(ui.composer, "/unknown");
+        assert!(ui.composing);
+    }
+
+    #[test]
+    fn commands_reuse_existing_pages_and_forms() {
         let (mut ui, _) = ui();
         for (page, index, kind) in [
             (Page::Library, 1, FormKind::Export),
-            (Page::Convert, 0, FormKind::Convert),
             (Page::Tools, 1, FormKind::Plugin),
             (Page::Accounts, 0, FormKind::Import),
-            (Page::Settings, 0, FormKind::Settings),
         ] {
             ui.action(Action::Page(page)).unwrap();
             ui.focus = 3;
@@ -2001,6 +2782,291 @@ mod tests {
             assert!(matches!(&ui.dialog, Some(Dialog::Form(f)) if f.kind == kind));
             ui.action(Action::Close).unwrap();
         }
+        ui.composer = "/convert".into();
+        ui.run_composer(false).unwrap();
+        assert!(matches!(&ui.dialog, Some(Dialog::Form(form)) if form.kind == FormKind::Convert));
+        ui.dialog = None;
+        ui.composer = "/system settings".into();
+        ui.run_composer(false).unwrap();
+        assert!(matches!(&ui.dialog, Some(Dialog::Form(form)) if form.kind == FormKind::Settings));
+        ui.dialog = None;
+        ui.composer = "/queue issues".into();
+        ui.run_composer(false).unwrap();
+        assert_eq!(ui.page, Page::Downloads);
+        assert!(ui.issues_only);
+    }
+
+    #[test]
+    fn notices_and_page_actions_are_keyboard_and_mouse_accessible() {
+        let (mut ui, mut rx) = ui();
+        ui.notice = "Dependency check complete.".into();
+        ui.composer = "/system doctor".into();
+        ui.run_composer(false).unwrap();
+        assert_eq!(ui.page, Page::Tools);
+        assert!(matches!(rx.try_recv().unwrap().0, Request::Doctor));
+        assert!(matches!(rx.try_recv().unwrap().0, Request::Plugins));
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut ui)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Dependency check complete."));
+        assert!(ui
+            .hits
+            .iter()
+            .any(|hit| matches!(hit.action, Action::Doctor)));
+
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(ui.focus, 3);
+        ui.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .unwrap();
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(&ui.dialog, Some(Dialog::Form(form)) if form.kind == FormKind::Plugin));
+
+        ui.dialog = None;
+        ui.action(Action::Page(Page::Downloads)).unwrap();
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(ui.focus, 4);
+    }
+
+    #[test]
+    fn autocomplete_uses_the_same_top_level_and_subcommands() {
+        let (mut ui, mut rx) = ui();
+        ui.composer = "/que".into();
+        assert_eq!(ui.command_matches()[0].0, "queue");
+        ui.composer = "/queue re".into();
+        let matches = ui.command_matches();
+        assert!(matches.iter().any(|(value, _)| value == "queue resume"));
+        assert!(matches.iter().any(|(value, _)| value == "queue retry"));
+        ui.composer = "/system plugins a".into();
+        assert_eq!(ui.command_matches()[0].0, "system plugins add");
+        ui.composer = "/syt".into();
+        assert_eq!(ui.command_matches()[0].0, "system");
+        ui.composer = "/system dctr".into();
+        assert_eq!(ui.command_matches()[0].0, "system doctor");
+        ui.composing = true;
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(ui.composer, "/system doctor ");
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(ui.page, Page::Tools);
+        assert!(matches!(rx.try_recv().unwrap().0, Request::Doctor));
+        assert!(matches!(rx.try_recv().unwrap().0, Request::Plugins));
+    }
+
+    #[test]
+    fn mouse_clicks_focus_and_blur_the_composer_without_losing_its_draft() {
+        let (mut ui, _) = ui();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut ui)).unwrap();
+        let composer = ui
+            .hits
+            .iter()
+            .find(|hit| matches!(hit.action, Action::Compose))
+            .unwrap()
+            .area;
+        ui.click(Position::new(composer.x + 1, composer.y + 1))
+            .unwrap();
+        terminal.draw(|frame| draw(frame, &mut ui)).unwrap();
+        let focused: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(focused.contains(">  _"));
+        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(ui.composer, "a");
+
+        ui.click(Position::new(0, 0)).unwrap();
+        assert!(!ui.composing);
+        ui.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(ui.composer, "a");
+
+        ui.click(Position::new(composer.x + 1, composer.y + 1))
+            .unwrap();
+        ui.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(ui.composer, "ab");
+
+        ui.composer = "/".into();
+        terminal.draw(|frame| draw(frame, &mut ui)).unwrap();
+        let moved_composer = ui
+            .hits
+            .iter()
+            .find(|hit| matches!(hit.action, Action::Compose))
+            .unwrap()
+            .area;
+        let suggestion = ui
+            .hits
+            .iter()
+            .find(|hit| matches!(hit.action, Action::ChooseCommand(0)))
+            .unwrap()
+            .area;
+        assert!(suggestion.y >= composer.y);
+        assert!(suggestion.bottom() <= moved_composer.y);
+        assert!(moved_composer.y > composer.y);
+        assert_eq!(suggestion.x, moved_composer.x + 1);
+        assert_eq!(suggestion.right(), moved_composer.right() - 1);
+        ui.click(Position::new(suggestion.x, suggestion.y)).unwrap();
+        assert_eq!(ui.composer, "/add ");
+        assert!(ui.composing);
+    }
+
+    #[test]
+    fn queue_commands_only_target_eligible_jobs() {
+        let (mut ui, mut rx) = ui();
+        let mut active = job(1);
+        active.status = Status::Active;
+        let mut paused = job(2);
+        paused.status = Status::Paused;
+        let mut failed = job(3);
+        failed.status = Status::Failed;
+        failed.resume_supported = false;
+        let mut completed = job(4);
+        completed.status = Status::Completed;
+        ui.snapshot.jobs = vec![active.clone(), paused, failed, completed];
+        ui.composer = "/queue pause all".into();
+        ui.run_composer(false).unwrap();
+        let (request, _) = rx.try_recv().unwrap();
+        assert!(
+            matches!(request, Request::Control { ids, action: Control::Pause, .. } if ids == vec![active.id])
+        );
+        ui.composer = "/queue nonsense".into();
+        ui.composing = true;
+        assert!(ui.run_composer(false).is_err());
+        assert_eq!(ui.composer, "/queue nonsense");
+        ui.composer = "/queue issues".into();
+        ui.run_composer(false).unwrap();
+        ui.selected = 1;
+        ui.composer = "/queue retry".into();
+        ui.run_composer(false).unwrap();
+        assert!(matches!(
+            &ui.dialog,
+            Some(Dialog::Restart {
+                action: Control::Retry,
+                ..
+            })
+        ));
+        ui.action(Action::Submit).unwrap();
+        let (request, _) = rx.try_recv().unwrap();
+        assert!(matches!(
+            request,
+            Request::Control {
+                action: Control::Retry,
+                allow_restart: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn account_removal_requires_confirmation() {
+        let (mut ui, mut rx) = ui();
+        ui.snapshot.accounts.push(Account {
+            name: "main".into(),
+            domains: vec!["example.com".into()],
+            cookies: 1,
+            expired: 0,
+        });
+        ui.composer = "/account remove main".into();
+        ui.run_composer(false).unwrap();
+        assert!(matches!(&ui.dialog, Some(Dialog::RemoveAccount { .. })));
+        assert!(rx.try_recv().is_err());
+        ui.action(Action::Submit).unwrap();
+        let (request, tag) = rx.try_recv().unwrap();
+        assert!(matches!(request, Request::RemoveAccount(name) if name == "main"));
+        assert_eq!(tag, "account-removed");
+    }
+
+    #[test]
+    fn add_detects_torrents_without_an_extra_command() {
+        let (ui, _) = ui();
+        let mut form = ui.form(FormKind::Add);
+        form.fields[0].value = "magnet:?xt=urn:btih:fixture".into();
+        assert_eq!(form_specs(&form).unwrap()[0].kind, JobKind::Torrent);
+        form.fields[0].value = "https://example.com/file.torrent".into();
+        assert_eq!(form_specs(&form).unwrap()[0].kind, JobKind::Torrent);
+    }
+
+    #[test]
+    fn composer_routes_existing_files_by_type() {
+        let (mut ui, mut rx) = ui();
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("clip.mp4");
+        std::fs::write(&media, b"fixture").unwrap();
+        ui.composer = media.to_string_lossy().into();
+        ui.run_composer(false).unwrap();
+        assert!(matches!(
+            &ui.dialog,
+            Some(Dialog::Form(form)) if form.kind == FormKind::Convert
+        ));
+
+        ui.dialog = None;
+        let torrent = dir.path().join("download.TORRENT");
+        std::fs::write(&torrent, b"fixture").unwrap();
+        ui.composer = torrent.to_string_lossy().into();
+        ui.run_composer(false).unwrap();
+        let (request, _) = rx.try_recv().unwrap();
+        assert!(matches!(
+            request,
+            Request::Submit(specs) if specs.len() == 1 && specs[0].kind == JobKind::Torrent
+        ));
+    }
+
+    #[test]
+    fn paste_appends_to_an_active_composer() {
+        let (mut ui, _) = ui();
+        ui.composer = "/add ".into();
+        ui.composing = true;
+        ui.command_cursor = 3;
+        ui.paste("https://example.com/video\r\n".into());
+        assert_eq!(ui.composer, "/add https://example.com/video\n");
+        assert_eq!(ui.command_cursor, 0);
+
+        ui.composing = false;
+        ui.paste("  https://example.com/other  ".into());
+        assert_eq!(ui.composer, "https://example.com/other");
+        assert!(ui.composing);
+    }
+
+    #[test]
+    fn navigation_and_submission_clear_transient_filters() {
+        let (mut ui, _) = ui();
+        ui.search = "hidden".into();
+        ui.searching = true;
+        ui.issues_only = true;
+        ui.marked.insert("job".into());
+        ui.action(Action::Page(Page::Library)).unwrap();
+        assert!(ui.search.is_empty());
+        assert!(!ui.searching);
+        assert!(!ui.issues_only);
+        assert!(ui.marked.is_empty());
+
+        ui.search = "hidden".into();
+        ui.searching = true;
+        ui.issues_only = true;
+        ui.selected = 4;
+        ui.marked.insert("job".into());
+        ui.response("submitted".into(), Ok(serde_json::json!({})));
+        assert_eq!(ui.page, Page::Downloads);
+        assert_eq!(ui.selected, 0);
+        assert!(ui.search.is_empty());
+        assert!(!ui.searching);
+        assert!(!ui.issues_only);
+        assert!(ui.marked.is_empty());
     }
 
     #[test]
@@ -2066,7 +3132,7 @@ mod tests {
         ] {
             let mut terminal =
                 Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-            for page in PAGES {
+            for page in [Page::Downloads, Page::Library, Page::Tools, Page::Accounts] {
                 ui.action(Action::Page(page)).unwrap();
                 ui.dialog = None;
                 terminal.draw(|f| draw(f, &mut ui)).unwrap();
@@ -2079,10 +3145,10 @@ mod tests {
                 ] {
                     ui.action(action).unwrap();
                     terminal.draw(|f| draw(f, &mut ui)).unwrap();
-                    assert!(ui
-                        .hits
-                        .iter()
-                        .all(|h| !matches!(h.action, Action::Page(_) | Action::Quit)));
+                    assert!(ui.hits.iter().all(|h| !matches!(
+                        h.action,
+                        Action::Page(_) | Action::Quit | Action::Compose | Action::Row(_)
+                    )));
                     ui.dialog = None;
                 }
             }
@@ -2112,5 +3178,92 @@ mod tests {
         assert_eq!(ui.marked.len(), 1);
         ui.action(Action::Page(Page::Library)).unwrap();
         assert!(ui.marked.is_empty());
+    }
+
+    #[test]
+    fn issues_stay_hidden_until_requested() {
+        let (mut ui, _) = ui();
+        let mut failed = job(1);
+        failed.status = Status::Failed;
+        let active = job(2);
+        ui.snapshot.jobs = vec![failed, active];
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut ui)).unwrap();
+        let issue_action = ui
+            .hits
+            .iter()
+            .find(|hit| matches!(hit.action, Action::Issues))
+            .unwrap()
+            .action
+            .clone();
+        assert_eq!(
+            ui.visible()
+                .into_iter()
+                .map(|job| job.id)
+                .collect::<Vec<_>>(),
+            vec![ui.snapshot.jobs[1].id.clone()]
+        );
+        ui.action(issue_action).unwrap();
+        assert_eq!(
+            ui.visible()
+                .into_iter()
+                .map(|job| job.id)
+                .collect::<Vec<_>>(),
+            vec![ui.snapshot.jobs[0].id.clone()]
+        );
+    }
+
+    #[test]
+    fn composer_moves_down_as_activity_grows() {
+        let (mut ui, _) = ui();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        let composer_y = |terminal: &mut Terminal<_>, ui: &mut Ui| {
+            terminal.draw(|frame| draw(frame, ui)).unwrap();
+            ui.hits
+                .iter()
+                .find(|hit| matches!(hit.action, Action::Compose))
+                .unwrap()
+                .area
+                .y
+        };
+        let empty = composer_y(&mut terminal, &mut ui);
+        ui.snapshot.jobs.push(job(1));
+        let one = composer_y(&mut terminal, &mut ui);
+        ui.snapshot.jobs.extend((2..=4).map(job));
+        let four = composer_y(&mut terminal, &mut ui);
+        assert!(empty < one && one < four, "{empty}, {one}, {four}");
+    }
+
+    #[test]
+    fn progress_uses_solid_fill_blank_remainder_and_end_cap() {
+        let p = Palette::new();
+        let line = progress_line(&job(1), 32, p);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(32, 1)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new(line.clone()), frame.area()))
+            .unwrap();
+        let rendered: String = (0..32)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(rendered.contains('|'));
+        assert!(!rendered.chars().any(|c| matches!(c, '░' | '▒' | '▓')));
+    }
+
+    #[test]
+    fn logo_uses_five_rows_of_seamless_background_cells() {
+        let palette = Palette::new();
+        let lines = logo_lines(palette);
+        assert_eq!(lines.len(), 5);
+        assert!(lines.iter().all(|line| line.width() == 110));
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(!rendered.chars().any(|c| matches!(c, '░' | '▒' | '▓')));
+        assert!(lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| { span.style.bg.is_some_and(|color| color != palette.bg) }));
     }
 }

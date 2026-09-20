@@ -1,5 +1,5 @@
 """Real binary/worker integration checks against a controlled local HTTP server."""
-import argparse, hashlib, http.server, json, os, pathlib, socketserver, subprocess, threading, time, tempfile, shutil
+import argparse, hashlib, http.server, json, os, pathlib, re, socketserver, subprocess, threading, time, tempfile, shutil
 
 class Fixture(http.server.BaseHTTPRequestHandler):
     payload = bytes(range(256)) * 8192
@@ -81,7 +81,7 @@ def main():
             tone=run_dir/'tone.wav';subprocess.run([ffmpeg,'-hide_banner','-loglevel','error','-f','lavfi','-i','sine=frequency=440:duration=1','-y',str(tone)],check=True)
             ids=data('convert',tone,'--format','flac','--output',output,'--detach');j=wait_job(ids[0]);assert pathlib.Path(j['files'][0]).stat().st_size>0;report.append('Real FFmpeg conversion')
         library=data('library');assert library;export=run_dir/'library.json';data('library','--export',export);assert json.loads(export.read_text(encoding='utf-8'));report.append('Library listing and export')
-        render=run_dir/'preview.ansi';subprocess.run([binary,'--data-dir',str(profile),'render',str(render)],check=True);assert 'OMNI' in render.read_text(encoding='utf-8');report.append('Dashboard rendering')
+        render=run_dir/'preview.ansi';subprocess.run([binary,'--data-dir',str(profile),'render',str(render)],check=True);assert 'Paste a URL' in re.sub(r'\x1b\[[0-9;]*m','',render.read_text(encoding='utf-8'));report.append('Dashboard rendering')
         data('worker','stop');time.sleep(.3);assert not data('worker','status')['running'];report.append('Graceful worker shutdown')
         result={'passed':len(report),'checks':report,'run_dir':str(run_dir),'platform':os.name};(root/'verification.json').write_text(json.dumps(result,indent=2),encoding='utf-8');print(json.dumps(result,indent=2))
     finally:

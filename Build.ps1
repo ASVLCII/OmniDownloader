@@ -17,7 +17,9 @@ if ($env:OS -eq 'Windows_NT') {
     $sdk = $env:OMNIDOWNLOADER_WINDOWS_SDK
     if (-not $sdk) {
         $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Lib'
-        $version = Get-ChildItem -LiteralPath $sdkRoot -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+        $version = Get-ChildItem -LiteralPath $sdkRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { (Test-Path -LiteralPath (Join-Path $_.FullName 'um\x64')) -and (Test-Path -LiteralPath (Join-Path $_.FullName 'ucrt\x64')) } |
+            Sort-Object Name -Descending | Select-Object -First 1
         if ($version) { $sdk = $version.FullName }
     }
     if (-not $sdk) { throw 'Windows SDK libraries missing. Set OMNIDOWNLOADER_WINDOWS_SDK to a directory containing um and ucrt libraries.' }

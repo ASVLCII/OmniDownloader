@@ -159,14 +159,37 @@ pub fn validate_spec(spec: &JobSpec) -> Result<()> {
             Path::new(&spec.source).is_file(),
             "Conversion input does not exist"
         );
-    } else if spec.kind == JobKind::Torrent && spec.source.starts_with("magnet:") {
-    } else if spec.kind == JobKind::Torrent
-        && Path::new(&spec.source).extension().and_then(|x| x.to_str()) == Some("torrent")
-    {
-        anyhow::ensure!(
-            Path::new(&spec.source).is_file(),
-            "Torrent file does not exist"
-        );
+    } else if spec.kind == JobKind::Torrent {
+        if spec.source.starts_with("magnet:") {
+        } else if !spec.source.contains("://")
+            && Path::new(&spec.source)
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| x.eq_ignore_ascii_case("torrent"))
+        {
+            anyhow::ensure!(
+                Path::new(&spec.source).is_file(),
+                "Torrent file does not exist"
+            );
+        } else if let Ok(url) = url::Url::parse(&spec.source) {
+            anyhow::ensure!(
+                matches!(url.scheme(), "http" | "https"),
+                "Only HTTP and HTTPS URLs are supported for this job"
+            );
+            anyhow::ensure!(
+                url.username().is_empty() && url.password().is_none(),
+                "URL credentials are not supported; use an account"
+            );
+            anyhow::ensure!(
+                Path::new(url.path())
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|x| x.eq_ignore_ascii_case("torrent")),
+                "Torrent URLs must end in .torrent"
+            );
+        } else {
+            anyhow::bail!("Torrent file must use .torrent extension or magnet:");
+        }
     } else {
         let url = url::Url::parse(&spec.source).context("Enter an http:// or https:// URL")?;
         anyhow::ensure!(
