@@ -952,8 +952,8 @@ impl Ui {
             Action::Compose=>{self.composing=true;self.focus=4;self.global=false;}
             Action::ChooseCommand(index)=>{if let Some((value,_))=self.command_matches().get(index){self.composer=format!("/{value} ");self.command_cursor=0;self.composing=true;self.focus=4;}}
             Action::Fill(value)=>{self.composer=value;self.command_cursor=0;self.composing=true;self.global=false;self.focus=4;}
-            Action::OpenFolder=>{if let Some(job)=self.visible().get(self.selected){self.info("Download folder",format!("{}\n\n{}",job.title,job.destination.display()));}}
-            Action::CopyPath=>{if let Some(job)=self.visible().get(self.selected){let path=job.files.first().map(|p|p.display().to_string()).unwrap_or_else(||job.destination.display().to_string());self.info("File path",format!("{path}\n\nSelect and copy it from here."));}}
+            Action::OpenFolder=>{if let Some(job)=self.visible().get(self.selected){let dir=job.destination.display().to_string();if open_in_file_manager(&job.destination).is_err(){self.info("Download folder",format!("{}\n\n{dir}",job.title));}}}
+            Action::CopyPath=>{if let Some(job)=self.visible().get(self.selected){let path=job.files.first().map(|p|p.display().to_string()).unwrap_or_else(||job.destination.display().to_string());if copy_to_clipboard(&path).is_err(){self.info("File path",format!("{path}\n\nSelect and copy it from here."));}}}
             Action::QueueJob(id)=>{self.action(Action::Page(Page::Downloads))?;if let Some(index)=self.visible().iter().position(|job|job.id==id){self.selected=index;self.focus=2;}}
             Action::Issues=>{self.action(Action::Page(Page::Downloads))?;self.issues_only=true;}
         }
@@ -1581,6 +1581,58 @@ pub fn bytes(value: u64) -> String {
     } else {
         format!("{value} B")
     }
+}
+
+// ponytail: OS launchers via std only. Failures fall back to showing the path.
+fn open_in_file_manager(path: &Path) -> Result<()> {
+    let target = path.display().to_string();
+    #[cfg(windows)]
+    std::process::Command::new("explorer")
+        .arg(target)
+        .spawn()?
+        .wait()?;
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open")
+        .arg(target)
+        .spawn()?
+        .wait()?;
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    std::process::Command::new("xdg-open")
+        .arg(target)
+        .spawn()?
+        .wait()?;
+    Ok(())
+}
+
+// ponytail: clipboard via piped OS utilities, no new crates. Tiny input only.
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    use std::{io::Write, process::Stdio};
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("clip")
+        .stdin(Stdio::piped())
+        .spawn()?;
+    #[cfg(target_os = "macos")]
+    let mut child = std::process::Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()?;
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let mut child = std::process::Command::new("xclip")
+        .args(["-selection", "clipboard"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .or_else(|_| {
+            std::process::Command::new("xsel")
+                .args(["--clipboard", "--input"])
+                .stdin(Stdio::piped())
+                .spawn()
+        })?;
+    child
+        .stdin
+        .take()
+        .context("Clipboard pipe unavailable")?
+        .write_all(text.as_bytes())?;
+    child.wait()?;
+    Ok(())
 }
 
 fn button(frame: &mut Frame, ui: &mut Ui, area: Rect, label: &str, action: Action, active: bool) {
@@ -3629,7 +3681,8 @@ mod tests {
             .any(|h| matches!(h.action, Action::OpenFolder)));
         assert!(ui.hits.iter().any(|h| matches!(h.action, Action::CopyPath)));
         ui.action(Action::CopyPath).unwrap();
-        assert!(matches!(&ui.dialog, Some(Dialog::Info { .. })));
+        // ponytail: real clipboard when the OS utility exists, info fallback otherwise.
+        assert!(ui.dialog.is_none() || matches!(&ui.dialog, Some(Dialog::Info { .. })));
         ui.dialog = None;
         ui.focus = 3;
         ui.detail_focus = 4;

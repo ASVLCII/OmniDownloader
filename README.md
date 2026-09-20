@@ -1,5 +1,9 @@
 # OmniDownloader
 
+[![Release](https://img.shields.io/github/v/release/ASVLCII/OmniDownloader)](https://github.com/ASVLCII/OmniDownloader/releases/latest)
+[![Build](https://github.com/ASVLCII/OmniDownloader/actions/workflows/ci.yml/badge.svg)](https://github.com/ASVLCII/OmniDownloader/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 <p align="center">
   <img src="./omnidownloader-logo-shaded.svg" alt="OmniDownloader" width="900">
 </p>
@@ -23,9 +27,12 @@
 
 ## Install
 
-### Windows release
+| Platform | Download |
+|---|---|
+| Windows x64 | `omnidownloader-windows-x86_64.exe` from the [latest release](https://github.com/ASVLCII/OmniDownloader/releases/latest) |
+| Linux x64 / macOS | Attached to releases as CI publishes them; until then use Cargo below |
 
-Download `omnidownloader-windows-x86_64.exe` from the latest GitHub release, rename it to `omnidownloader.exe`, and place it in a directory on `PATH`.
+Rename the binary to `omnidownloader` (`omnidownloader.exe` on Windows) and place it in a directory on `PATH`.
 
 Then open the TUI from any terminal:
 
@@ -39,6 +46,17 @@ omnidownloader
 cargo install --git https://github.com/ASVLCII/OmniDownloader --locked
 omnidownloader
 ```
+
+## First download in one minute
+
+1. Run `omnidownloader` and click the composer (or press `/`).
+2. Paste a link and press Enter to preview it.
+3. Press Enter again on `Add to queue`, or `Ctrl+Enter` to queue immediately.
+4. Watch progress in the activity view and queue rail; finished files land in your download folder.
+
+## Privacy
+
+Everything runs on your computer: the queue, worker, accounts, and cookies stay in your local profile. There is no account, no telemetry, and logs redact URL secrets.
 
 ## TUI
 
